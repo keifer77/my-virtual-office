@@ -419,6 +419,8 @@ def _sync_hermes_state_from_file(filepath):
             _state[agent_id] = {
                 "state": entry.get("state", current.get("state", "idle")),
                 "task": entry.get("task", ""),
+                "lastInput": entry.get("lastInput", current.get("lastInput")),
+                "lastOutput": entry.get("lastOutput", current.get("lastOutput")),
                 "updated": now,
                 "source": "hermes-file",
             }

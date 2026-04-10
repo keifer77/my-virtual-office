@@ -17,6 +17,8 @@ def main():
     parser.add_argument(
         "--clear-task", action="store_true", help="Force task to empty string"
     )
+    parser.add_argument("--last-input", default=None, help="Last input text")
+    parser.add_argument("--last-output", default=None, help="Last output text")
     args = parser.parse_args()
 
     status_dir = os.environ.get("VO_STATUS_DIR", "/tmp/vo-data")
@@ -35,7 +37,20 @@ def main():
         data = {}
 
     task = "" if args.clear_task else args.task
-    data[args.agent] = {"state": args.state, "task": task}
+    current = data.get(args.agent, {}) if isinstance(data.get(args.agent, {}), dict) else {}
+    entry = {"state": args.state, "task": task}
+
+    if args.last_input is not None:
+        entry["lastInput"] = {"text": args.last_input}
+    elif "lastInput" in current:
+        entry["lastInput"] = current["lastInput"]
+
+    if args.last_output is not None:
+        entry["lastOutput"] = {"text": args.last_output}
+    elif "lastOutput" in current:
+        entry["lastOutput"] = current["lastOutput"]
+
+    data[args.agent] = entry
 
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)

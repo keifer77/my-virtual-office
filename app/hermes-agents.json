@@ -1,0 +1,64 @@
+{
+  "branches": [
+    { "id": "ops", "name": "OPS", "emoji": "⚙️", "color": "#4a90e2", "theme": "branch-blue" },
+    { "id": "research", "name": "R&D", "emoji": "🔬", "color": "#7b61ff", "theme": "branch-cyan" }
+  ],
+  "agents": [
+    {
+      "id": "hermes-main",
+      "name": "Hermes Main",
+      "emoji": "🧠",
+      "role": "Coordinator",
+      "branch": "ops",
+      "color": "#4a90e2",
+      "statusKey": "hermes-main",
+      "gender": "M",
+      "appearance": {
+        "skinTone": "#ffcc80",
+        "hairStyle": "short",
+        "hairColor": "#3e2723",
+        "hairHighlight": null,
+        "eyebrowStyle": "thick",
+        "eyeColor": "#212121",
+        "facialHair": null,
+        "facialHairColor": null,
+        "costume": null,
+        "headwear": null,
+        "headwearColor": null,
+        "glasses": null,
+        "glassesColor": null,
+        "heldItem": "coffee",
+        "deskItem": "chart"
+      },
+      "conversation_name": "office:hermes-main:main"
+    },
+    {
+      "id": "research-agent",
+      "name": "Research",
+      "emoji": "🔎",
+      "role": "Research",
+      "branch": "research",
+      "color": "#7b61ff",
+      "statusKey": "research-agent",
+      "gender": "F",
+      "appearance": {
+        "skinTone": "#e8b88a",
+        "hairStyle": "long",
+        "hairColor": "#5d4037",
+        "hairHighlight": null,
+        "eyebrowStyle": "arched",
+        "eyeColor": "#1565c0",
+        "facialHair": null,
+        "facialHairColor": null,
+        "costume": null,
+        "headwear": null,
+        "headwearColor": null,
+        "glasses": "round",
+        "glassesColor": "#333333",
+        "heldItem": "clipboard",
+        "deskItem": "microscope"
+      },
+      "conversation_name": "office:research-agent:main"
+    }
+  ]
+}

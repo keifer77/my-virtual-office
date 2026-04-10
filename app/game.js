@@ -38,7 +38,7 @@ function _loadServerConfig() {
         if (data.floor) officeConfig.floor = data.floor;
         if (data.furniture) officeConfig.furniture = data.furniture;
         if (data.agents) officeConfig.agents = data.agents;
-        if (data.branches) officeConfig.branches = data.branches;
+        if (data.branches && !_rosterLoaded) officeConfig.branches = data.branches;
         if (data.pet) officeConfig.pet = data.pet;
         // Migration: add default interactive windows if none exist
         if (officeConfig.furniture && !officeConfig.furniture.some(function(f){ return f.type === 'interactiveWindow'; })) {
@@ -1883,9 +1883,13 @@ function _autoAssignDesks(agentDefs) {
 // Fetch roster from server
 var _rosterLoaded = false;
 function _fetchRoster() {
-    fetch('/api/agents').then(function(r) { return r.json(); }).then(function(data) {
+    fetch('hermes-agents.json').then(function(r) { return r.json(); }).then(function(data) {
+        if (data.branches && data.branches.length > 0) {
+            officeConfig.branches = data.branches;
+            _invalidateBranchCache();
+        }
         if (data.agents && data.agents.length > 0) {
-            AGENT_DEFS = _buildAgentDefs(data.agents);
+            AGENT_DEFS = data.agents;
             _autoAssignDesks(AGENT_DEFS);
             if (!_rosterLoaded) {
                 _rosterLoaded = true;

@@ -927,6 +927,10 @@
     async function applyModelChange() {
         const sel = document.getElementById('modal-model-select');
         const status = document.getElementById('modal-model-status');
+        if (!_modelsCache || !_modelsCache.models || _modelsCache.models.length === 0) {
+            status.textContent = 'Model switching not configured';
+            return;
+        }
         const agent = window.selectedAgent;
         if (!agent) return;
         const model = sel.value;

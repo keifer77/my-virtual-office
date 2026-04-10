@@ -4281,6 +4281,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             # Sync meetings from file on every status poll (office.py writes here)
             gateway_presence._sync_meetings_from_file()
+            gateway_presence._sync_hermes_state_from_file(
+                os.path.join(STATUS_DIR, "hermes-state.json")
+            )
             state = gateway_presence.get_state()
             self.wfile.write(json.dumps(state).encode())
         elif self.path == "/agents-list":

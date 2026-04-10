@@ -26,9 +26,9 @@ except ImportError:
 
 # ─── In-Memory Presence State ────────────────────────────────────
 
-_state = {}        # agent_id → {state, task, updated, source}
+_state = {}  # agent_id → {state, task, updated, source}
 _state_lock = threading.Lock()
-_meetings = []     # Meetings still managed manually via office.py
+_meetings = []  # Meetings still managed manually via office.py
 _meetings_lock = threading.Lock()
 
 # Manual overrides (from office.py or POST /api/presence) expire after this many seconds
@@ -44,7 +44,7 @@ SESSIONS_POLL_SEC = 10
 _last_updated_at = {}  # session_key → updatedAt timestamp (ms)
 
 # Track real-time event activity per agent
-_last_event_at = {}   # agent_id → timestamp (seconds)
+_last_event_at = {}  # agent_id → timestamp (seconds)
 _last_event_task = {}  # agent_id → task description from event
 
 # Manual override tracking
@@ -78,18 +78,15 @@ def set_manual_override(agent_id, state, task=""):
         "state": state,
         "task": task,
         "updated": now,
-        "expires": now + MANUAL_OVERRIDE_TTL
+        "expires": now + MANUAL_OVERRIDE_TTL,
     }
     # Immediately apply to state
     with _state_lock:
         if agent_id not in _state:
             _state[agent_id] = {}
-        _state[agent_id].update({
-            "state": state,
-            "task": task,
-            "updated": now,
-            "source": "manual"
-        })
+        _state[agent_id].update(
+            {"state": state, "task": task, "updated": now, "source": "manual"}
+        )
 
 
 def set_meetings(meetings_list):
@@ -137,10 +134,16 @@ def init_agents(agent_ids):
     with _state_lock:
         for aid in agent_ids:
             if aid not in _state:
-                _state[aid] = {"state": "idle", "task": "", "updated": 0, "source": "init"}
+                _state[aid] = {
+                    "state": "idle",
+                    "task": "",
+                    "updated": 0,
+                    "source": "init",
+                }
 
 
 # ─── Event Processing ────────────────────────────────────────────
+
 
 def _extract_agent_id(session_key):
     """Extract agent_id from session key like 'agent:pq-mike:main'."""
@@ -159,7 +162,8 @@ def _format_tool_task(name, arguments):
         cmd = args.get("command", "")
         if "openclaw agent" in cmd:
             import re
-            m_agent = re.search(r'--agent\s+(\S+)', cmd)
+
+            m_agent = re.search(r"--agent\s+(\S+)", cmd)
             m_msg = re.search(r'--message\s+"([^"]*)"', cmd)
             aname = m_agent.group(1) if m_agent else "agent"
             mtxt = m_msg.group(1)[:40] if m_msg else ""
@@ -256,12 +260,14 @@ def _process_event(event_type, payload):
         with _state_lock:
             if agent_id not in _state:
                 _state[agent_id] = {}
-            _state[agent_id].update({
-                "state": "working",
-                "task": task,
-                "updated": int(now),
-                "source": "gateway"
-            })
+            _state[agent_id].update(
+                {
+                    "state": "working",
+                    "task": task,
+                    "updated": int(now),
+                    "source": "gateway",
+                }
+            )
 
 
 def _process_sessions_list(sessions):
@@ -299,9 +305,16 @@ def _process_sessions_list(sessions):
         # Auto-register agents discovered from gateway
         with _state_lock:
             if agent_id not in _state:
-                _state[agent_id] = {"state": "idle", "task": "", "updated": 0, "source": "discovered"}
+                _state[agent_id] = {
+                    "state": "idle",
+                    "task": "",
+                    "updated": 0,
+                    "source": "discovered",
+                }
 
-        session_is_fresh = updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC
+        session_is_fresh = (
+            updated_at and ((now_ms - updated_at) / 1000) < IDLE_TIMEOUT_SEC
+        )
         session_changed = updated_at > prev_updated
 
         if session_is_fresh and (session_changed or prev_updated == 0):
@@ -314,20 +327,19 @@ def _process_sessions_list(sessions):
                     current = _state[agent_id].get("state", "idle")
                     current_task = _state[agent_id].get("task", "")
                     if current != "working" or not current_task:
-                        _state[agent_id].update({
-                            "state": "working",
-                            "task": current_task or "Active",
-                            "updated": int(now),
-                            "source": "gateway-poll"
-                        })
+                        _state[agent_id].update(
+                            {
+                                "state": "working",
+                                "task": current_task or "Active",
+                                "updated": int(now),
+                                "source": "gateway-poll",
+                            }
+                        )
 
         _last_updated_at[key] = updated_at
 
         # Check for idle timeout
-        last_activity = max(
-            updated_at / 1000,
-            _last_event_at.get(agent_id, 0)
-        )
+        last_activity = max(updated_at / 1000, _last_event_at.get(agent_id, 0))
         idle_for = now - last_activity
 
         if idle_for > IDLE_TIMEOUT_SEC:
@@ -335,15 +347,19 @@ def _process_sessions_list(sessions):
                 current_state = _state[agent_id].get("state", "idle")
                 current_source = _state[agent_id].get("source", "")
                 # Only skip if there's an ACTIVE (non-expired) manual override
-                has_active_override = (agent_id in _manual_overrides and
-                    _manual_overrides[agent_id]["expires"] > now)
+                has_active_override = (
+                    agent_id in _manual_overrides
+                    and _manual_overrides[agent_id]["expires"] > now
+                )
                 if current_state == "working" and not has_active_override:
-                    _state[agent_id].update({
-                        "state": "idle",
-                        "task": "",
-                        "updated": int(now),
-                        "source": "gateway-idle"
-                    })
+                    _state[agent_id].update(
+                        {
+                            "state": "idle",
+                            "task": "",
+                            "updated": int(now),
+                            "source": "gateway-idle",
+                        }
+                    )
 
 
 # ─── Meeting File Sync ────────────────────────────────────────────
@@ -375,11 +391,45 @@ def _sync_meetings_from_file():
         print(f"⚠️  Gateway presence: meeting sync error: {e}")
 
 
+def _sync_hermes_state_from_file(filepath):
+    """Read Hermes agent state from a JSON file and update _state for each agent found.
+
+    Expected file format:
+    {
+      "agent-id": {"state": "working", "task": "Researching..."},
+      ...
+    }
+    """
+    try:
+        with open(filepath, "r") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    except Exception as e:
+        print(f"⚠️  Gateway presence: Hermes state sync error: {e}")
+        return
+    if not isinstance(data, dict):
+        return
+    now = int(time.time())
+    with _state_lock:
+        for agent_id, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            current = _state.get(agent_id, {})
+            _state[agent_id] = {
+                "state": entry.get("state", current.get("state", "idle")),
+                "task": entry.get("task", ""),
+                "updated": now,
+                "source": "hermes-file",
+            }
+
+
 # ─── Gateway Connection ──────────────────────────────────────────
+
 
 async def _gateway_loop(gateway_url, gateway_token, origin):
     """Main gateway connection loop with reconnection.
-    
+
     Uses a single-reader architecture: one coroutine reads all WS messages
     and dispatches to event processing + routes responses to the poller.
     """
@@ -402,8 +452,13 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
                 raw = await asyncio.wait_for(ws.recv(), timeout=10)
                 msg = json.loads(raw)
 
-                if msg.get("type") != "event" or msg.get("event") != "connect.challenge":
-                    print(f"⚠️  Gateway presence: unexpected first message: {msg.get('type')}")
+                if (
+                    msg.get("type") != "event"
+                    or msg.get("event") != "connect.challenge"
+                ):
+                    print(
+                        f"⚠️  Gateway presence: unexpected first message: {msg.get('type')}"
+                    )
                     await asyncio.sleep(5)
                     continue
 
@@ -419,15 +474,15 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
                             "id": "openclaw-control-ui",
                             "version": "2026.2.9",
                             "platform": "server",
-                            "mode": "webchat"
+                            "mode": "webchat",
                         },
                         "role": "operator",
                         "scopes": ["operator.read"],
                         "caps": [],
                         "commands": [],
                         "permissions": {},
-                        "auth": {"token": gateway_token}
-                    }
+                        "auth": {"token": gateway_token},
+                    },
                 }
                 await ws.send(json.dumps(connect_msg))
 
@@ -438,12 +493,20 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
                     err = res.get("error", {}).get("message", "unknown error")
                     _gw_error = err
                     _consecutive_failures += 1
-                    should_log = (_consecutive_failures == 1 or _consecutive_failures % 10 == 0)
+                    should_log = (
+                        _consecutive_failures == 1 or _consecutive_failures % 10 == 0
+                    )
                     if should_log:
-                        print(f"❌ Gateway presence: connect failed: {err} (attempt {_consecutive_failures})")
+                        print(
+                            f"❌ Gateway presence: connect failed: {err} (attempt {_consecutive_failures})"
+                        )
                     # Show one-time tip for origin not allowed
-                    if not _origin_tip_shown and ("origin" in err.lower() or "not allowed" in err.lower()):
-                        print("💡 Tip: Run the setup wizard or add your origin to gateway.controlUi.allowedOrigins in openclaw.json")
+                    if not _origin_tip_shown and (
+                        "origin" in err.lower() or "not allowed" in err.lower()
+                    ):
+                        print(
+                            "💡 Tip: Run the setup wizard or add your origin to gateway.controlUi.allowedOrigins in openclaw.json"
+                        )
                         _origin_tip_shown = True
                     sleep_sec = min(60, 5 * (2 ** min(_consecutive_failures - 1, 4)))
                     await asyncio.sleep(sleep_sec)
@@ -471,21 +534,27 @@ async def _gateway_loop(gateway_url, gateway_token, origin):
             _gw_connected = False
             _gw_error = str(e)
             _consecutive_failures += 1
-            should_log = (_consecutive_failures == 1 or _consecutive_failures % 10 == 0)
+            should_log = _consecutive_failures == 1 or _consecutive_failures % 10 == 0
             if should_log:
                 if "Connect call failed" in str(e) or "Connection refused" in str(e):
-                    print(f"⚠️  Gateway presence: gateway not reachable at {gateway_url} (attempt {_consecutive_failures})")
+                    print(
+                        f"⚠️  Gateway presence: gateway not reachable at {gateway_url} (attempt {_consecutive_failures})"
+                    )
                 else:
-                    print(f"⚠️  Gateway presence: connection error: {e} (attempt {_consecutive_failures})")
+                    print(
+                        f"⚠️  Gateway presence: connection error: {e} (attempt {_consecutive_failures})"
+                    )
             sleep_sec = min(60, 5 * (2 ** min(_consecutive_failures - 1, 4)))
             await asyncio.sleep(sleep_sec)
         except Exception as e:
             _gw_connected = False
             _gw_error = str(e)
             _consecutive_failures += 1
-            should_log = (_consecutive_failures == 1 or _consecutive_failures % 10 == 0)
+            should_log = _consecutive_failures == 1 or _consecutive_failures % 10 == 0
             if should_log:
-                print(f"⚠️  Gateway presence: error: {e} (attempt {_consecutive_failures})")
+                print(
+                    f"⚠️  Gateway presence: error: {e} (attempt {_consecutive_failures})"
+                )
                 traceback.print_exc()
             sleep_sec = min(60, 5 * (2 ** min(_consecutive_failures - 1, 4)))
             await asyncio.sleep(sleep_sec)
@@ -531,12 +600,7 @@ async def _sessions_poller(ws, response_queue):
             req_counter += 1
             req_id = f"gp-sl-{req_counter}"
 
-            req = {
-                "type": "req",
-                "id": req_id,
-                "method": "sessions.list",
-                "params": {}
-            }
+            req = {"type": "req", "id": req_id, "method": "sessions.list", "params": {}}
             await ws.send(json.dumps(req))
 
             # Wait for our response from the queue
@@ -544,7 +608,9 @@ async def _sessions_poller(ws, response_queue):
             while time.time() < deadline:
                 try:
                     remaining = max(0.1, deadline - time.time())
-                    msg = await asyncio.wait_for(response_queue.get(), timeout=remaining)
+                    msg = await asyncio.wait_for(
+                        response_queue.get(), timeout=remaining
+                    )
 
                     if msg.get("id") == req_id:
                         if msg.get("ok"):
@@ -612,7 +678,9 @@ def start(gateway_url, gateway_token, port=8090):
                 for task in pending:
                     task.cancel()
                 if pending:
-                    _loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    _loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
                 _loop.close()
             except Exception:
                 pass
@@ -631,6 +699,7 @@ def stop():
 
 
 # ─── Snapshot to Disk (for crash recovery) ────────────────────────
+
 
 def save_snapshot(filepath):
     """Save current state to disk for crash recovery."""
@@ -659,7 +728,7 @@ def load_snapshot(filepath):
                         "state": "idle",
                         "task": "",
                         "updated": val.get("updated", 0),
-                        "source": "snapshot"
+                        "source": "snapshot",
                     }
         print(f"✅ Gateway presence: loaded snapshot from {filepath}")
     except FileNotFoundError:

@@ -18,6 +18,7 @@ def main():
         "--clear-task", action="store_true", help="Force task to empty string"
     )
     parser.add_argument("--last-input", default=None, help="Last input text")
+    parser.add_argument("--last-input-from", default=None, help="Sender/source label for last input")
     parser.add_argument("--last-output", default=None, help="Last output text")
     args = parser.parse_args()
 
@@ -42,6 +43,10 @@ def main():
 
     if args.last_input is not None:
         entry["lastInput"] = {"text": args.last_input}
+        if args.last_input_from is not None:
+            entry["lastInput"]["from"] = args.last_input_from
+        elif isinstance(current.get("lastInput"), dict) and "from" in current["lastInput"]:
+            entry["lastInput"]["from"] = current["lastInput"]["from"]
     elif "lastInput" in current:
         entry["lastInput"] = current["lastInput"]
 

@@ -158,6 +158,32 @@ from project_store import MarkdownProjectStore
 
 PROJECT_STORE = MarkdownProjectStore(STATUS_DIR)
 
+_HERMES_AGENTS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hermes-agents.json"
+)
+_hermes_agents_cache = {"mtime": 0, "data": None}
+
+
+def _load_hermes_agents():
+    """Load the hermes-agents.json roster file (cached, auto-refreshed on change)."""
+    global _hermes_agents_cache
+    try:
+        mtime = os.path.getmtime(_HERMES_AGENTS_PATH)
+    except OSError:
+        return {"branches": [], "agents": []}
+    if (
+        _hermes_agents_cache["data"] is not None
+        and mtime == _hermes_agents_cache["mtime"]
+    ):
+        return _hermes_agents_cache["data"]
+    try:
+        with open(_HERMES_AGENTS_PATH, "r") as f:
+            data = json.load(f)
+        _hermes_agents_cache = {"mtime": mtime, "data": data}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"branches": [], "agents": []}
+
 _discovered_roster = discover_agents(WORKSPACE_BASE)
 _discovered_at = time.time()
 DISCOVERY_REFRESH_SEC = 300  # re-discover every 5 min
@@ -4262,11 +4288,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            # Return dynamically discovered agent roster
-            refresh_agent_maps()
-            # Load office-config overrides for agent names/emoji/branch
+            # Roster from hermes-agents.json with office-config overrides
+            hermes = _load_hermes_agents()
             _oc_overrides = {}
             _oc_branches = {}
+            _hermes_branches = {b["id"]: b for b in hermes.get("branches", []) if b.get("id")}
             try:
                 _oc_path = os.path.join(STATUS_DIR, "office-config.json")
                 with open(_oc_path, "r") as f:
@@ -4275,29 +4301,30 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     _oc_id = _oc_agent.get("id", "")
                     if _oc_id:
                         _oc_overrides[_oc_id] = _oc_agent
-                # Build branch ID → display name map
                 for _br in _oc_data.get("branches", []):
                     _br_id = _br.get("id", "")
                     if _br_id:
                         _oc_branches[_br_id] = _br.get("name", _br_id)
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
+            # Merge hermes branches into branch map (hermes takes priority)
+            for _bid, _bobj in _hermes_branches.items():
+                _oc_branches[_bid] = _bobj.get("name", _bid)
             agents = []
-            for a in get_roster():
-                session_key = f"agent:{a['id']}:main"
-                # Prefer office-config name/emoji over IDENTITY.md
-                oc = _oc_overrides.get(a["statusKey"], {})
-                # Resolve branch ID to display name
-                branch_id = oc.get("branch", "")
+            for a in hermes.get("agents", []):
+                agent_key = a.get("statusKey") or a.get("id", "")
+                session_key = f"agent:{a.get('id', '')}:main"
+                oc = _oc_overrides.get(agent_key, {})
+                branch_id = oc.get("branch", a.get("branch", ""))
                 branch_name = _oc_branches.get(branch_id, "") if branch_id else ""
                 if not branch_name:
                     branch_name = "Unassigned"
                 agents.append({
-                    "key": a["statusKey"],
-                    "agentId": a["id"],
+                    "key": agent_key,
+                    "agentId": a.get("id", ""),
                     "sessionKey": session_key,
-                    "emoji": oc.get("emoji") or a["emoji"],
-                    "name": oc.get("name") or a["name"],
+                    "emoji": oc.get("emoji") or a.get("emoji", "🤖"),
+                    "name": oc.get("name") or a.get("name", a.get("id", "")),
                     "role": a.get("role", ""),
                     "model": a.get("model", ""),
                     "lastActiveAt": a.get("lastActiveAt", 0),
@@ -4625,19 +4652,19 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             contacts = self._get_sms_contacts()
             self.wfile.write(json.dumps(contacts).encode())
         elif self.path == "/api/agents":
-            # Full discovered agent roster
-            refresh_agent_maps()
+            # Roster from hermes-agents.json
+            hermes = _load_hermes_agents()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             roster = []
-            for a in get_roster():
+            for a in hermes.get("agents", []):
                 roster.append({
-                    "id": a["id"],
-                    "statusKey": a["statusKey"],
-                    "name": a["name"],
-                    "emoji": a["emoji"],
+                    "id": a.get("id", ""),
+                    "statusKey": a.get("statusKey") or a.get("id", ""),
+                    "name": a.get("name", a.get("id", "")),
+                    "emoji": a.get("emoji", "🤖"),
                     "role": a.get("role", ""),
                     "model": a.get("model", ""),
                     "lastActiveAt": a.get("lastActiveAt", 0),
@@ -4910,7 +4937,17 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         """Read agent's .md files and return structured bio data."""
         ws_dir = AGENT_WORKSPACES.get(agent_key)
         if not ws_dir:
-            return {"error": f"Unknown agent: {agent_key}"}
+            hermes = _load_hermes_agents()
+            hermes_keys = {
+                a.get("statusKey") or a.get("id", "")
+                for a in hermes.get("agents", [])
+            }
+            if agent_key in hermes_keys:
+                ws_dir = get_agent_workspace_dir(WORKSPACE_BASE, agent_key).replace(
+                    WORKSPACE_BASE + "/", ""
+                )
+            else:
+                return {"error": f"Unknown agent: {agent_key}"}
 
         ws_path = os.path.join(WORKSPACE_BASE, ws_dir)
         result = {}
@@ -5602,8 +5639,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         try:
             with open(CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
-        except Exception as e:
-            return {"error": str(e), "models": [], "agents": {}}
+        except FileNotFoundError:
+            cfg = {}
+        except Exception:
+            cfg = {}
 
         models = []
         # Default model
@@ -5700,6 +5739,13 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         agent_models = {}
         for sk, aid in status_to_agent.items():
             agent_models[sk] = agents.get(aid, "")
+
+        # Ensure hermes agents appear in agentModels even without OpenClaw config
+        hermes = _load_hermes_agents()
+        for a in hermes.get("agents", []):
+            sk = a.get("statusKey") or a.get("id", "")
+            if sk and sk not in agent_models:
+                agent_models[sk] = a.get("model", "") or default_model
 
         # Identify subscription/OAuth providers for frontend tagging
         sub_providers = {}
@@ -6638,8 +6684,13 @@ def start_ws_server():
 
 
 def start_http_server():
-    # Initialize gateway presence with discovered agents
-    agent_ids = [a["statusKey"] for a in get_roster()]
+    # Initialize gateway presence with hermes agents
+    hermes = _load_hermes_agents()
+    agent_ids = [
+        a.get("statusKey") or a.get("id")
+        for a in hermes.get("agents", [])
+        if a.get("statusKey") or a.get("id")
+    ]
     gateway_presence.init_agents(agent_ids)
 
     # Set the meetings file path (office.py still writes meetings here)

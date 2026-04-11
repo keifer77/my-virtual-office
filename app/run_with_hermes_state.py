@@ -7,14 +7,30 @@ import sys
 import os
 
 
-def set_state(agent, state, task):
+def set_state(
+    agent,
+    state,
+    task,
+    last_input=None,
+    last_input_from=None,
+    last_output=None,
+    clear_task=False,
+):
     script = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "set_hermes_state.py"
     )
-    subprocess.run(
-        [sys.executable, script, "--agent", agent, "--state", state, "--task", task],
-        check=False,
-    )
+    cmd = [sys.executable, script, "--agent", agent, "--state", state]
+    if clear_task:
+        cmd.append("--clear-task")
+    else:
+        cmd.extend(["--task", task])
+    if last_input is not None:
+        cmd.extend(["--last-input", last_input])
+    if last_input_from is not None:
+        cmd.extend(["--last-input-from", last_input_from])
+    if last_output is not None:
+        cmd.extend(["--last-output", last_output])
+    subprocess.run(cmd, check=False)
 
 
 def main():
@@ -37,13 +53,28 @@ def main():
         print("Error: no command provided after --", file=sys.stderr)
         sys.exit(1)
 
-    set_state(args.agent, "working", args.task)
+    set_state(
+        args.agent,
+        "working",
+        args.task,
+        last_input=args.task,
+        last_input_from="Wrapper",
+    )
+
+    exit_code = 1
     try:
         result = subprocess.run(command)
+        exit_code = result.returncode
+    except Exception:
+        exit_code = 1
     finally:
-        set_state(args.agent, "idle", "")
+        if exit_code == 0:
+            summary = "Command completed successfully."
+        else:
+            summary = f"Command failed with exit code {exit_code}."
+        set_state(args.agent, "idle", "", clear_task=True, last_output=summary)
 
-    sys.exit(result.returncode)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

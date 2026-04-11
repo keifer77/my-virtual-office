@@ -4498,6 +4498,59 @@ function updateSidebar() {
         div.className = 'agent-entry';
         div.innerHTML = `<span class="dot ${displayState}"></span><span class="name">${agent.emoji} ${agent.name}</span><span class="state">${displayState}</span>`;
         div.onclick = () => openModal(agent);
+        if (agent.actions && agent.actions.length > 0) {
+            const btns = document.createElement('span');
+            btns.className = 'agent-actions';
+            agent.actions.forEach(function(act) {
+                const btn = document.createElement('button');
+                btn.className = 'agent-action-btn';
+                if (act.running) {
+                    btn.disabled = true;
+                    btn.textContent = act.label + ' ⏳';
+                } else {
+                    btn.textContent = act.label;
+                }
+                btn.onclick = function(e) {
+                    e.stopPropagation();
+                    if (!act.running) triggerAgentAction(agent, act);
+                };
+                btns.appendChild(btn);
+                if (act.running) {
+                    const cbtn = document.createElement('button');
+                    cbtn.className = 'agent-action-btn agent-action-cancel';
+                    cbtn.textContent = '✕';
+                    cbtn.title = 'Cancel ' + act.label;
+                    cbtn.onclick = function(e) {
+                        e.stopPropagation();
+                        cancelAgentAction(agent, act);
+                    };
+                    btns.appendChild(cbtn);
+                }
+                const vbtn = document.createElement('button');
+                vbtn.className = 'agent-action-btn agent-action-view';
+                vbtn.textContent = '📋';
+                vbtn.title = 'View output';
+                vbtn.onclick = function(e) {
+                    e.stopPropagation();
+                    viewAgentActionLog(agent, act);
+                };
+                btns.appendChild(vbtn);
+            });
+            div.appendChild(btns);
+        }
+        var agentKey = agent.statusKey || agent.id;
+        if (agent.actions && agent.actions.length > 0) {
+            agent.actions.forEach(function(act) {
+                var logKey = agentKey + '_' + act.id;
+                if (_openActionLogs[logKey]) {
+                    _openActionLogs[logKey].running = !!act.running;
+                    var pre = document.createElement('pre');
+                    pre.className = 'agent-action-log';
+                    pre.textContent = _openActionLogs[logKey].content || '(no content)';
+                    div.appendChild(pre);
+                }
+            });
+        }
         const branchId = byBranch[agent.branch] ? agent.branch : 'UNASSIGNED';
         byBranch[branchId].push(div);
     });
@@ -4555,6 +4608,96 @@ function updateSidebar() {
     document.getElementById('count-break').textContent = counts.break;
 }
 setInterval(updateSidebar, 1000);
+
+var _openActionLogs = {};
+var _actionLogRefreshTimer = null;
+
+function _refreshOpenActionLogs() {
+    var keys = Object.keys(_openActionLogs);
+    if (keys.length === 0) return;
+    keys.forEach(function(logKey) {
+        var info = _openActionLogs[logKey];
+        if (!info.running) return;
+        var key = info.agentKey;
+        var actionId = encodeURIComponent(info.actionId);
+        fetch('/api/agent/action-log?agent=' + key + '&action_id=' + actionId)
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.ok) {
+                    info.content = data.content || '(empty log)';
+                } else {
+                    info.content = data.error || 'No log yet';
+                }
+            })
+            .catch(function() {});
+    });
+}
+setInterval(_refreshOpenActionLogs, 3000);
+
+function viewAgentActionLog(agent, action) {
+    var agentKey = agent.statusKey || agent.id;
+    var logKey = agentKey + '_' + action.id;
+    if (_openActionLogs[logKey]) {
+        delete _openActionLogs[logKey];
+        return;
+    }
+    var entry = {
+        agentKey: agentKey,
+        actionId: action.id,
+        content: 'Loading...',
+        running: !!action.running,
+    };
+    _openActionLogs[logKey] = entry;
+    var actionId = encodeURIComponent(action.id);
+    fetch('/api/agent/action-log?agent=' + agentKey + '&action_id=' + actionId)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (data.ok) {
+                entry.content = data.content || '(empty log)';
+            } else {
+                entry.content = data.error || 'No log yet';
+            }
+        })
+        .catch(function(e) {
+            entry.content = 'Error: ' + e.message;
+        });
+}
+
+function triggerAgentAction(agent, action) {
+    const key = agent.statusKey || agent.id;
+    fetch('/api/agent/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent: key, action_id: action.id })
+    }).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.ok) {
+            addGlobalLog('⚡ ' + agent.name + ': ' + action.label + ' launched');
+        } else {
+            addGlobalLog('❌ ' + agent.name + ': ' + (data.error || 'Action failed'));
+        }
+        setTimeout(function() { pollStatus(); }, 2000);
+    }).catch(function(e) {
+        addGlobalLog('❌ ' + agent.name + ': ' + e.message);
+    });
+}
+
+function cancelAgentAction(agent, action) {
+    const key = agent.statusKey || agent.id;
+    fetch('/api/agent/action-cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent: key, action_id: action.id })
+    }).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.ok && data.cancelled) {
+            addGlobalLog('🛑 ' + agent.name + ': ' + action.label + ' cancelled');
+        } else {
+            addGlobalLog('❌ ' + agent.name + ': ' + (data.error || 'Cancel failed'));
+        }
+        setTimeout(function() { pollStatus(); }, 1000);
+    }).catch(function(e) {
+        addGlobalLog('❌ ' + agent.name + ': ' + e.message);
+    });
+}
 
 function branchCreatePrompt() {
     var name = prompt('New branch name:');

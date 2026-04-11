@@ -30,7 +30,29 @@
         "heldItem": "coffee",
         "deskItem": "chart"
       },
-      "conversation_name": "office:hermes-main:main"
+      "conversation_name": "office:hermes-main:main",
+      "actions": [
+        {
+          "id": "repo-analysis",
+          "label": "Repo analysis",
+          "command": "python3 app/run_with_hermes_state.py --agent hermes-main --task \"Repo analysis\" -- python3 app/repo_analysis_task.py"
+        },
+        {
+          "id": "git-status",
+          "label": "Git status",
+          "command": "python3 app/run_with_hermes_state.py --agent hermes-main --task \"Git status\" -- python3 app/git_status_task.py"
+        },
+        {
+          "id": "hermes-probe",
+          "label": "Hermes probe",
+          "command": "python3 app/run_with_hermes_state.py --agent hermes-main --task \"Hermes probe\" -- python3 app/hermes_probe_task.py"
+        },
+        {
+          "id": "hermes-repo-summary",
+          "label": "Hermes repo summary",
+          "command": "python3 app/run_with_hermes_state.py --agent hermes-main --task \"Hermes repo summary\" -- python3 app/hermes_repo_summary_task.py"
+        }
+      ]
     },
     {
       "id": "research-agent",

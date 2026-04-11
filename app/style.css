@@ -437,6 +437,7 @@ button:active { transform: translateY(3px); box-shadow: none; }
     font-size: 7px;
     cursor: pointer;
     touch-action: manipulation;
+    flex-wrap: wrap;
 }
 .agent-entry .dot {
     width: 6px; height: 6px; border-radius: 50%;
@@ -462,6 +463,23 @@ button:active { transform: translateY(3px); box-shadow: none; }
 .agent-entry .dot[class*="sipping"] { background: #8d6e63; box-shadow: 0 0 4px #8d6e63; }
 .agent-entry .name { color: #ccc; min-width: 40px; }
 .agent-entry .state { color: #888; font-size: 6px; margin-left: auto; }
+.agent-actions { display: flex; gap: 3px; margin-left: 4px; flex-wrap: wrap; }
+.agent-action-btn {
+    font-size: 6px; padding: 1px 4px; border: 1px solid #555; border-radius: 2px;
+    background: rgba(255,255,255,0.08); color: #aaa; cursor: pointer; white-space: nowrap;
+}
+.agent-action-btn:hover { background: rgba(255,255,255,0.18); color: #fff; }
+.agent-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.agent-action-view { font-size: 5px; padding: 1px 3px; }
+.agent-action-cancel { color: #f44; font-size: 6px; padding: 1px 3px; border-color: #933; }
+.agent-action-cancel:hover { background: rgba(255,68,68,0.22); color: #f88; }
+.agent-action-log {
+    font-size: 5px; color: #aaa; background: rgba(0,0,0,0.5);
+    border: 1px solid #333; border-radius: 2px; padding: 4px 6px;
+    margin: 2px 0 0 0; max-height: 80px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; line-height: 1.4;
+    width: 100%; box-sizing: border-box;
+}
 
 .status-panel {
     background: rgba(0,0,0,0.4);

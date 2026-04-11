@@ -2,6 +2,7 @@
 """Virtual Office server.
 Serves static files, status JSON, and proxies WebSocket to the OpenClaw gateway.
 """
+
 import asyncio
 import base64
 import http.server
@@ -33,6 +34,7 @@ def _env_or(key, fallback):
     val = os.environ.get(key)
     return val if val else fallback
 
+
 def _resolve_config_path():
     """Return path to vo-config.json — prefers /data/ (persistent volume) over /app/ (container layer)."""
     if os.environ.get("VO_CONFIG"):
@@ -57,6 +59,7 @@ def _resolve_config_path():
     # Fall back to app-bundled default
     return app_cfg
 
+
 def _load_vo_config():
     """Load vo-config.json with env-var overrides. Returns merged dict."""
     cfg_path = _resolve_config_path()
@@ -68,9 +71,8 @@ def _load_vo_config():
         pass
 
     # Auto-detect OpenClaw home — check env, config, then common paths
-    oc_home = (
-        os.environ.get("VO_OPENCLAW_PATH")
-        or (cfg.get("openclaw") or {}).get("homePath")
+    oc_home = os.environ.get("VO_OPENCLAW_PATH") or (cfg.get("openclaw") or {}).get(
+        "homePath"
     )
     if not oc_home:
         # Search common locations
@@ -80,7 +82,10 @@ def _load_vo_config():
             "/root/.openclaw",  # common root install
         ]
         for c in candidates:
-            if os.path.isdir(c) and (os.path.isfile(os.path.join(c, "openclaw.json")) or os.path.isdir(os.path.join(c, "agents"))):
+            if os.path.isdir(c) and (
+                os.path.isfile(os.path.join(c, "openclaw.json"))
+                or os.path.isdir(os.path.join(c, "agents"))
+            ):
                 oc_home = c
                 break
         if not oc_home:
@@ -104,11 +109,17 @@ def _load_vo_config():
         },
         "openclaw": {
             "homePath": oc_home,
-            "gatewayUrl": _env_or("VO_GATEWAY_URL", openclaw.get("gatewayUrl", "ws://127.0.0.1:18789")),
-            "gatewayHttp": _env_or("VO_GATEWAY_HTTP", openclaw.get("gatewayHttp", "http://127.0.0.1:18789")),
+            "gatewayUrl": _env_or(
+                "VO_GATEWAY_URL", openclaw.get("gatewayUrl", "ws://127.0.0.1:18789")
+            ),
+            "gatewayHttp": _env_or(
+                "VO_GATEWAY_HTTP", openclaw.get("gatewayHttp", "http://127.0.0.1:18789")
+            ),
         },
         "presence": {
-            "statusDir": _env_or("VO_STATUS_DIR", presence.get("statusDir", "/tmp/vo-data")),
+            "statusDir": _env_or(
+                "VO_STATUS_DIR", presence.get("statusDir", "/tmp/vo-data")
+            ),
             "inferenceEnabled": presence.get("inferenceEnabled", True),
             "inferenceIdleTimeoutSec": presence.get("inferenceIdleTimeoutSec", 300),
         },
@@ -123,7 +134,9 @@ def _load_vo_config():
             "url": _env_or("VO_PC_METRICS_URL", pc_metrics.get("url")),
         },
         "whisper": {
-            "url": _env_or("VO_WHISPER_URL", whisper_cfg.get("url", "http://127.0.0.1:8087")),
+            "url": _env_or(
+                "VO_WHISPER_URL", whisper_cfg.get("url", "http://127.0.0.1:8087")
+            ),
         },
         "browser": {
             "cdpUrl": _env_or("VO_CDP_URL", browser_cfg.get("cdpUrl")),
@@ -134,11 +147,16 @@ def _load_vo_config():
         },
         "sms": {
             "agentId": _env_or("VO_SMS_AGENT_ID", sms_cfg.get("agentId")),
-            "twilioAccountSid": _env_or("VO_TWILIO_ACCOUNT_SID", sms_cfg.get("twilioAccountSid")),
-            "twilioAuthToken": _env_or("VO_TWILIO_AUTH_TOKEN", sms_cfg.get("twilioAuthToken")),
+            "twilioAccountSid": _env_or(
+                "VO_TWILIO_ACCOUNT_SID", sms_cfg.get("twilioAccountSid")
+            ),
+            "twilioAuthToken": _env_or(
+                "VO_TWILIO_AUTH_TOKEN", sms_cfg.get("twilioAuthToken")
+            ),
             "fromNumber": _env_or("VO_TWILIO_FROM_NUMBER", sms_cfg.get("fromNumber")),
         },
     }
+
 
 VO_CONFIG = _load_vo_config()
 
@@ -149,11 +167,19 @@ STATUS_DIR = VO_CONFIG["presence"]["statusDir"]
 os.makedirs(STATUS_DIR, exist_ok=True)
 STATUS_FILE = os.path.join(STATUS_DIR, "virtual-office-status.json")
 PROJECTS_FILE = os.path.join(STATUS_DIR, "projects.json")
-AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profiles.json")
+AUTH_PROFILES_PATH = os.path.join(
+    WORKSPACE_BASE, "agents/main/agent/auth-profiles.json"
+)
 
 # ─── DYNAMIC AGENT DISCOVERY ─────────────────────────────────
 from discovery import discover_agents, get_agent_workspace_dir, get_agent_session_id
-from license import get_license_status, activate_license, deactivate_license, check_feature, get_agent_limit
+from license import (
+    get_license_status,
+    activate_license,
+    deactivate_license,
+    check_feature,
+    get_agent_limit,
+)
 from project_store import MarkdownProjectStore
 
 PROJECT_STORE = MarkdownProjectStore(STATUS_DIR)
@@ -184,9 +210,122 @@ def _load_hermes_agents():
     except (json.JSONDecodeError, OSError):
         return {"branches": [], "agents": []}
 
+
+_running_actions = {}  # (agent_key, action_id) -> {pid, log_path, log_f, proc, started_at}
+_action_results = {}  # (agent_key, action_id) -> {agent, action_id, pid, log_path, started_at, finished_at, exit_code, status}
+
+
+def _cleanup_running_actions():
+    """Remove entries for action processes that have exited and record results."""
+    finished = []
+    for key, info in _running_actions.items():
+        if info["proc"].poll() is not None:
+            exit_code = info["proc"].poll()
+            try:
+                info["log_f"].close()
+            except Exception:
+                pass
+            finished.append(key)
+            _action_results[key] = {
+                "agent": key[0],
+                "action_id": key[1],
+                "pid": info["proc"].pid,
+                "log_path": info["log_path"],
+                "started_at": info.get("started_at", 0),
+                "finished_at": int(time.time()),
+                "exit_code": exit_code,
+                "status": "succeeded" if exit_code == 0 else "failed",
+            }
+    for key in finished:
+        del _running_actions[key]
+
+
+def _enrich_actions_with_runtime_state(agent_key, actions):
+    """Add running state info to each action dict for a given agent."""
+    _cleanup_running_actions()
+    result = []
+    for a in actions:
+        entry = dict(a)
+        run_key = (agent_key, a.get("id", ""))
+        if run_key in _running_actions:
+            info = _running_actions[run_key]
+            entry["running"] = True
+            entry["pid"] = info["proc"].pid
+            entry["log_path"] = info["log_path"]
+        else:
+            entry["running"] = False
+        if run_key in _action_results:
+            entry["last_result"] = _action_results[run_key]
+        result.append(entry)
+    return result
+
+
+def _split_command(cmd):
+    """Split a command string into an argv list using POSIX shell quoting rules."""
+    import shlex
+
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return []
+
+
+_ACTION_COMMAND_ALLOWLIST = [
+    "python3",
+]
+
+_ACTION_ARGV_PREFIX_ALLOWLIST = [
+    ("python3", "run_with_hermes_state.py"),
+]
+
+_ACTION_WRAPPED_TASK_ALLOWLIST = [
+    ("python3", "repo_analysis_task.py"),
+    ("python3", "git_status_task.py"),
+    ("python3", "hermes_probe_task.py"),
+    ("python3", "hermes_repo_summary_task.py"),
+]
+
+
+def _is_action_command_allowed(argv):
+    """Check whether a parsed argv is allowed by the action command allowlist.
+
+    Validates both the outer launcher and the wrapped subcommand after '--'.
+    """
+    if not argv:
+        return False
+    if argv[0] not in _ACTION_COMMAND_ALLOWLIST:
+        return False
+    outer_ok = False
+    for prefix_argv, prefix_arg in _ACTION_ARGV_PREFIX_ALLOWLIST:
+        if argv[0] == prefix_argv and len(argv) >= 2 and argv[1].endswith(prefix_arg):
+            outer_ok = True
+            break
+    if not outer_ok:
+        return False
+    sep_idx = None
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            sep_idx = i
+            break
+    if sep_idx is None:
+        return True
+    if sep_idx + 1 >= len(argv):
+        return True
+    wrapped = argv[sep_idx + 1 :]
+    for task_argv, task_arg in _ACTION_WRAPPED_TASK_ALLOWLIST:
+        if (
+            wrapped[0] == task_argv
+            and len(wrapped) >= 2
+            and wrapped[1].endswith(task_arg)
+        ):
+            return True
+    return False
+
+
 _discovered_roster = discover_agents(WORKSPACE_BASE)
 _discovered_at = time.time()
 DISCOVERY_REFRESH_SEC = 300  # re-discover every 5 min
+
 
 def _refresh_discovery():
     """Refresh agent roster if stale."""
@@ -195,28 +334,52 @@ def _refresh_discovery():
         _discovered_roster = discover_agents(WORKSPACE_BASE)
         _discovered_at = time.time()
 
+
 def get_roster():
     """Get current discovered agent roster."""
     _refresh_discovery()
     return _discovered_roster
 
+
 # Build compatibility maps from discovery (these update on refresh)
 def _build_agent_info():
-    return {a["statusKey"]: {"id": a["id"], "emoji": a["emoji"], "name": a["name"], "branch": ""} for a in get_roster()}
+    return {
+        a["statusKey"]: {
+            "id": a["id"],
+            "emoji": a["emoji"],
+            "name": a["name"],
+            "branch": "",
+        }
+        for a in get_roster()
+    }
+
+
 def _build_agent_workspaces():
-    return {a["statusKey"]: get_agent_workspace_dir(WORKSPACE_BASE, a["id"]).replace(WORKSPACE_BASE + "/", "") if a["workspace"].startswith(WORKSPACE_BASE) else os.path.basename(a["workspace"]) for a in get_roster()}
+    return {
+        a["statusKey"]: get_agent_workspace_dir(WORKSPACE_BASE, a["id"]).replace(
+            WORKSPACE_BASE + "/", ""
+        )
+        if a["workspace"].startswith(WORKSPACE_BASE)
+        else os.path.basename(a["workspace"])
+        for a in get_roster()
+    }
+
+
 def _build_agent_session_ids():
     return {a["statusKey"]: get_agent_session_id(a["id"]) for a in get_roster()}
+
 
 # Compatibility properties (lazily rebuilt)
 @property
 def _agent_info_prop(self):
     return _build_agent_info()
 
+
 # For now, build once and provide as module-level (callers use these directly)
 AGENT_INFO = _build_agent_info()
 AGENT_WORKSPACES = _build_agent_workspaces()
 AGENT_SESSION_IDS = _build_agent_session_ids()
+
 
 def _patch_default_config_agents(config_str):
     """Replace hardcoded agents in default config with actual roster agents.
@@ -235,40 +398,102 @@ def _patch_default_config_agents(config_str):
         name = a.get("name") or agent_id
         # Seed a deterministic hash for random appearance
         h = int(hashlib.md5(agent_id.encode()).hexdigest(), 16)
-        skin_tones = ['#ffcc80','#d4a574','#c68642','#e8b88a','#fddcb5','#f5d0b0','#8d5524']
-        hair_styles = ['short','medium','long','curly','spiky','buzz','wavy']
-        hair_colors = ['#1a1a1a','#333333','#5d4037','#616161','#bf360c','#dcc282','#ffd700','#263238']
-        desk_items = ['trophy','envelope','calendar','chart','plans','checklist','files','ruler','money','marker']
-        gender = 'F' if (h >> 2) % 2 == 0 else 'M'
-        patched_agents.append({
-            "id": agent_id,
-            "name": name,
-            "role": a.get("role", "AI assistant"),
-            "emoji": a.get("emoji", "🤖"),
-            "color": _AGENT_COLORS_LIST[len(patched_agents) % len(_AGENT_COLORS_LIST)] if len(patched_agents) < len(_AGENT_COLORS_LIST) else '#607d8b',
-            "gender": gender,
-            "branch": "UNASSIGNED",
-            "statusKey": agent_id,
-            "appearance": {
-                "skinTone": skin_tones[h % len(skin_tones)],
-                "hairStyle": hair_styles[(h >> 3) % len(hair_styles)] if gender == 'M' else hair_styles[(h >> 3) % 3 + 2],
-                "hairColor": hair_colors[(h >> 5) % len(hair_colors)],
-                "hairHighlight": None,
-                "eyebrowStyle": "thin" if gender == 'F' else "thick",
-                "eyeColor": "#212121",
-                "facialHair": None, "facialHairColor": None,
-                "headwear": None, "headwearColor": None,
-                "glasses": None, "glassesColor": None,
-                "costume": None,
-                "heldItem": None,
-                "deskItem": desk_items[(h >> 8) % len(desk_items)]
+        skin_tones = [
+            "#ffcc80",
+            "#d4a574",
+            "#c68642",
+            "#e8b88a",
+            "#fddcb5",
+            "#f5d0b0",
+            "#8d5524",
+        ]
+        hair_styles = ["short", "medium", "long", "curly", "spiky", "buzz", "wavy"]
+        hair_colors = [
+            "#1a1a1a",
+            "#333333",
+            "#5d4037",
+            "#616161",
+            "#bf360c",
+            "#dcc282",
+            "#ffd700",
+            "#263238",
+        ]
+        desk_items = [
+            "trophy",
+            "envelope",
+            "calendar",
+            "chart",
+            "plans",
+            "checklist",
+            "files",
+            "ruler",
+            "money",
+            "marker",
+        ]
+        gender = "F" if (h >> 2) % 2 == 0 else "M"
+        patched_agents.append(
+            {
+                "id": agent_id,
+                "name": name,
+                "role": a.get("role", "AI assistant"),
+                "emoji": a.get("emoji", "🤖"),
+                "color": _AGENT_COLORS_LIST[
+                    len(patched_agents) % len(_AGENT_COLORS_LIST)
+                ]
+                if len(patched_agents) < len(_AGENT_COLORS_LIST)
+                else "#607d8b",
+                "gender": gender,
+                "branch": "UNASSIGNED",
+                "statusKey": agent_id,
+                "appearance": {
+                    "skinTone": skin_tones[h % len(skin_tones)],
+                    "hairStyle": hair_styles[(h >> 3) % len(hair_styles)]
+                    if gender == "M"
+                    else hair_styles[(h >> 3) % 3 + 2],
+                    "hairColor": hair_colors[(h >> 5) % len(hair_colors)],
+                    "hairHighlight": None,
+                    "eyebrowStyle": "thin" if gender == "F" else "thick",
+                    "eyeColor": "#212121",
+                    "facialHair": None,
+                    "facialHairColor": None,
+                    "headwear": None,
+                    "headwearColor": None,
+                    "glasses": None,
+                    "glassesColor": None,
+                    "costume": None,
+                    "heldItem": None,
+                    "deskItem": desk_items[(h >> 8) % len(desk_items)],
+                },
             }
-        })
+        )
     cfg["agents"] = patched_agents
     return json.dumps(cfg)
 
+
 # Color palette used for default config agent patching
-_AGENT_COLORS_LIST = ['#ffd700','#d32f2f','#1976d2','#388e3c','#f9a825','#e65100','#00897b','#7b1fa2','#6d4c41','#5c6bc0','#78909c','#4caf50','#00bcd4','#e91e90','#ff6d00','#795548','#607d8b','#9c27b0','#009688','#ff5722']
+_AGENT_COLORS_LIST = [
+    "#ffd700",
+    "#d32f2f",
+    "#1976d2",
+    "#388e3c",
+    "#f9a825",
+    "#e65100",
+    "#00897b",
+    "#7b1fa2",
+    "#6d4c41",
+    "#5c6bc0",
+    "#78909c",
+    "#4caf50",
+    "#00bcd4",
+    "#e91e90",
+    "#ff6d00",
+    "#795548",
+    "#607d8b",
+    "#9c27b0",
+    "#009688",
+    "#ff5722",
+]
+
 
 def refresh_agent_maps():
     """Call after discovery refresh to update compatibility maps."""
@@ -277,17 +502,20 @@ def refresh_agent_maps():
     AGENT_WORKSPACES = _build_agent_workspaces()
     AGENT_SESSION_IDS = _build_agent_session_ids()
 
+
 ##############################################################################
 # AGENT CREATION + SKILLS MANAGEMENT
 ##############################################################################
 
+
 def _sanitize_agent_id(name):
     """Convert a display name into a safe agent ID."""
     s = name.lower().strip()
-    s = re.sub(r'[^a-z0-9\s-]', '', s)
-    s = re.sub(r'[\s]+', '-', s)
-    s = re.sub(r'-+', '-', s).strip('-')
+    s = re.sub(r"[^a-z0-9\s-]", "", s)
+    s = re.sub(r"[\s]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
     return s or f"agent-{int(time.time())}"
+
 
 def _handle_agent_create(body):
     """Create a new OpenClaw agent from the VO app."""
@@ -324,14 +552,21 @@ def _handle_agent_create(body):
         os.makedirs(os.path.join(workspace_dir, "memory"), exist_ok=True)
         os.makedirs(os.path.join(workspace_dir, "skills"), exist_ok=True)
 
-        _write_template(workspace_dir, "IDENTITY.md", f"""# IDENTITY.md
+        _write_template(
+            workspace_dir,
+            "IDENTITY.md",
+            f"""# IDENTITY.md
 
 - **Name:** {name}
 - **Creature:** AI assistant
 - **Vibe:** Helpful, efficient, ready to work
 - **Emoji:** {emoji}
-""")
-        _write_template(workspace_dir, "SOUL.md", f"""# SOUL.md — {name}
+""",
+        )
+        _write_template(
+            workspace_dir,
+            "SOUL.md",
+            f"""# SOUL.md — {name}
 
 You are **{name}** {emoji} — {role}.
 
@@ -342,14 +577,22 @@ You are **{name}** {emoji} — {role}.
 
 ## Tool-First Rule
 You ALWAYS start with tool calls before responding with text. Every task requires ALL workflow steps in AGENTS.md — no exceptions.
-""")
-        _write_template(workspace_dir, "USER.md", """# USER.md
+""",
+        )
+        _write_template(
+            workspace_dir,
+            "USER.md",
+            """# USER.md
 
 - **Name:** (set by your owner)
 - **Timezone:** (set by your owner)
 - **Notes:** Prefers direct, clear communication.
-""")
-        _write_template(workspace_dir, "AGENTS.md", f"""# {name} {emoji} — {role}
+""",
+        )
+        _write_template(
+            workspace_dir,
+            "AGENTS.md",
+            f"""# {name} {emoji} — {role}
 
 ## Role
 {role}
@@ -366,13 +609,24 @@ You ALWAYS start with tool calls before responding with text. Every task require
 ## Memory
 - Daily logs: `memory/YYYY-MM-DD.md`
 - Long-term: `MEMORY.md`
-""")
-        _write_template(workspace_dir, "HEARTBEAT.md", """# HEARTBEAT.md
+""",
+        )
+        _write_template(
+            workspace_dir,
+            "HEARTBEAT.md",
+            """# HEARTBEAT.md
 
 # Add periodic tasks below. If nothing needs attention, reply HEARTBEAT_OK.
-""")
-        _write_template(workspace_dir, "MEMORY.md", f"# MEMORY.md - {name}\n\n_No memories yet._\n")
-        _write_template(workspace_dir, "TOOLS.md", f"# TOOLS.md — {name}\n\n_Add tool-specific notes here._\n")
+""",
+        )
+        _write_template(
+            workspace_dir, "MEMORY.md", f"# MEMORY.md - {name}\n\n_No memories yet._\n"
+        )
+        _write_template(
+            workspace_dir,
+            "TOOLS.md",
+            f"# TOOLS.md — {name}\n\n_Add tool-specific notes here._\n",
+        )
 
         # 3. Add agent to openclaw.json
         config_path = os.path.join(WORKSPACE_BASE, "openclaw.json")
@@ -381,7 +635,9 @@ You ALWAYS start with tool calls before responding with text. Every task require
 
         # Get defaults for model and memorySearch
         defaults = config.get("agents", {}).get("defaults", {})
-        default_model = model or defaults.get("model", {}).get("primary", "anthropic/claude-sonnet-4-6")
+        default_model = model or defaults.get("model", {}).get(
+            "primary", "anthropic/claude-sonnet-4-6"
+        )
         default_memory = defaults.get("memorySearch", {})
 
         new_agent_entry = {
@@ -396,7 +652,7 @@ You ALWAYS start with tool calls before responding with text. Every task require
                     "group:web",
                     "group:memory",
                     "message",
-                    "tts"
+                    "tts",
                 ]
             },
         }
@@ -424,7 +680,7 @@ You ALWAYS start with tool calls before responding with text. Every task require
             "agentId": agent_id,
             "name": name,
             "workspace": workspace_dir,
-            "message": f"Agent '{name}' ({agent_id}) created successfully"
+            "message": f"Agent '{name}' ({agent_id}) created successfully",
         }
 
     except Exception as e:
@@ -454,7 +710,10 @@ def _signal_gateway_reload():
             except (PermissionError, FileNotFoundError, ProcessLookupError):
                 continue
         # Fallback: try common PID file locations
-        for pidfile in ["/tmp/openclaw-gateway.pid", os.path.join(WORKSPACE_BASE, "gateway.pid")]:
+        for pidfile in [
+            "/tmp/openclaw-gateway.pid",
+            os.path.join(WORKSPACE_BASE, "gateway.pid"),
+        ]:
             if os.path.exists(pidfile):
                 with open(pidfile) as f:
                     pid = int(f.read().strip())
@@ -488,7 +747,14 @@ def _handle_skill_list(agent_key):
                         content = f.read()
                 except Exception:
                     content = ""
-                skills.append({"name": entry, "type": "folder", "description": desc, "content": content})
+                skills.append(
+                    {
+                        "name": entry,
+                        "type": "folder",
+                        "description": desc,
+                        "content": content,
+                    }
+                )
         elif entry.endswith(".md"):
             desc = _extract_skill_description(skill_path)
             try:
@@ -496,7 +762,14 @@ def _handle_skill_list(agent_key):
                     content = f.read()
             except Exception:
                 content = ""
-            skills.append({"name": entry.replace(".md", ""), "type": "file", "description": desc, "content": content})
+            skills.append(
+                {
+                    "name": entry.replace(".md", ""),
+                    "type": "file",
+                    "description": desc,
+                    "content": content,
+                }
+            )
     return {"skills": skills}
 
 
@@ -506,7 +779,12 @@ def _extract_skill_description(filepath):
         with open(filepath, "r") as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith("#") and not line.startswith("---") and not line.startswith("name:"):
+                if (
+                    line
+                    and not line.startswith("#")
+                    and not line.startswith("---")
+                    and not line.startswith("name:")
+                ):
                     return line[:200]
     except Exception:
         pass
@@ -529,7 +807,7 @@ def _handle_skill_write(agent_key, skill_name, body):
         return {"error": "Skill name is required", "_status": 400}
 
     # Sanitize name
-    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '-', name).strip('-')
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-")
     if not safe_name:
         return {"error": "Invalid skill name", "_status": 400}
 
@@ -549,9 +827,12 @@ def _handle_skill_write(agent_key, skill_name, body):
 
 # ─── SKILLS LIBRARY HANDLERS ─────────────────────────────────────
 
+
 def _get_skills_library_dir():
     """Return path to the central skills library (master copies, not agent-specific)."""
-    home = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
+    home = VO_CONFIG.get("openclaw", {}).get(
+        "homePath", os.path.expanduser("~/.openclaw")
+    )
     d = os.path.join(home, "skills-library")
     os.makedirs(d, exist_ok=True)
     return d
@@ -621,7 +902,7 @@ def _handle_skills_library_create(body):
     content = body.get("content", "")
     if not name:
         return {"error": "name is required", "_status": 400}
-    slug = re.sub(r'[^a-zA-Z0-9_-]', '-', name).strip('-').lower()
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-").lower()
     if not slug:
         return {"error": "Invalid skill name", "_status": 400}
     lib_dir = _get_skills_library_dir()
@@ -633,7 +914,13 @@ def _handle_skills_library_create(body):
     with open(skill_file, "w") as f:
         f.write(content)
     parsed_name, description = _parse_skill_frontmatter(content)
-    return {"ok": True, "skill": slug, "name": parsed_name or slug, "description": description, "path": skill_file}
+    return {
+        "ok": True,
+        "skill": slug,
+        "name": parsed_name or slug,
+        "description": description,
+        "path": skill_file,
+    }
 
 
 def _handle_skills_library_delete(skill_name):
@@ -669,10 +956,20 @@ def _handle_skills_library_apply(body):
     dest_dir = os.path.join(ws_path, "skills", skill_name)
     dest_file = os.path.join(dest_dir, "SKILL.md")
     if os.path.isfile(dest_file) and not overwrite:
-        return {"ok": False, "warning": f"Agent '{agent_id}' already has skill '{skill_name}'. Set overwrite=true to replace.", "exists": True}
+        return {
+            "ok": False,
+            "warning": f"Agent '{agent_id}' already has skill '{skill_name}'. Set overwrite=true to replace.",
+            "exists": True,
+        }
     os.makedirs(dest_dir, exist_ok=True)
     shutil.copy2(src_file, dest_file)
-    return {"ok": True, "skill": skill_name, "agentId": agent_id, "path": dest_file, "overwritten": os.path.isfile(dest_file) and overwrite}
+    return {
+        "ok": True,
+        "skill": skill_name,
+        "agentId": agent_id,
+        "path": dest_file,
+        "overwritten": os.path.isfile(dest_file) and overwrite,
+    }
 
 
 def _handle_skills_library_upload(body):
@@ -691,7 +988,7 @@ def _handle_skills_library_upload(body):
         name = filename.replace(".md", "").replace("SKILL", "").strip("-_ ")
     if not name:
         name = "uploaded-skill"
-    slug = re.sub(r'[^a-zA-Z0-9_-]', '-', name).strip('-').lower()
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-").lower()
     if not slug:
         slug = "uploaded-skill"
     lib_dir = _get_skills_library_dir()
@@ -796,8 +1093,8 @@ def _handle_meeting_create(body):
         "rules": {
             "mode": "discussion-not-work",
             "endWhen": "purpose-complete",
-            "resumeStateAfterEnd": "working-or-idle"
-        }
+            "resumeStateAfterEnd": "working-or-idle",
+        },
     }
     meetings.append(meeting)
     data["_meetings"] = meetings
@@ -819,7 +1116,10 @@ def _handle_meeting_end(body):
     responses = body.get("responses") or {}  # {agentKey: "what they said"}
 
     if not summary:
-        return {"error": "A meeting summary is required to end the meeting", "_status": 400}
+        return {
+            "error": "A meeting summary is required to end the meeting",
+            "_status": 400,
+        }
 
     data = _load_meetings_file()
     meetings = data.get("_meetings", [])
@@ -893,6 +1193,7 @@ def _handle_meeting_history_delete(meet_id):
 # ─── PROJECTS SCORING / GAMIFICATION ─────────────────────────────────────────
 SCORES_FILE = os.path.join(STATUS_DIR, "project-scores.json")
 
+
 def _load_scores():
     """Load project-scores.json. Format: { "agents": { "agent-key": { "score": N, "completed": N, "streak": N, "lastCompleted": "ISO" } } }"""
     try:
@@ -906,18 +1207,23 @@ def _load_scores():
     except (FileNotFoundError, json.JSONDecodeError):
         return {"agents": {}}
 
+
 def _save_scores(data):
     """Persist project-scores.json."""
     os.makedirs(os.path.dirname(SCORES_FILE), exist_ok=True)
     with open(SCORES_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+
 def _award_points(agent_key, points, reason="task_completed"):
     """Award points to an agent and update streak."""
     if not agent_key or agent_key in ("null", "None", "unassigned", ""):
         return None
     data = _load_scores()
-    agent = data["agents"].get(agent_key, {"score": 0, "completed": 0, "streak": 0, "lastCompleted": None, "history": []})
+    agent = data["agents"].get(
+        agent_key,
+        {"score": 0, "completed": 0, "streak": 0, "lastCompleted": None, "history": []},
+    )
 
     now = datetime.now(timezone.utc)
     now_str = now.isoformat()
@@ -952,21 +1258,31 @@ def _award_points(agent_key, points, reason="task_completed"):
 
     data["agents"][agent_key] = agent
     _save_scores(data)
-    return {"agent": agent_key, "pointsAwarded": points, "totalScore": agent["score"], "streak": agent["streak"], "completed": agent["completed"]}
+    return {
+        "agent": agent_key,
+        "pointsAwarded": points,
+        "totalScore": agent["score"],
+        "streak": agent["streak"],
+        "completed": agent["completed"],
+    }
+
 
 def _handle_scores_leaderboard():
     """GET /api/projects/scores — returns top agents sorted by score."""
     data = _load_scores()
     agents = []
     for key, info in data.get("agents", {}).items():
-        agents.append({
-            "agent": key,
-            "score": info.get("score", 0),
-            "completed": info.get("completed", 0),
-            "streak": info.get("streak", 0),
-        })
+        agents.append(
+            {
+                "agent": key,
+                "score": info.get("score", 0),
+                "completed": info.get("completed", 0),
+                "streak": info.get("streak", 0),
+            }
+        )
     agents.sort(key=lambda x: x["score"], reverse=True)
     return {"ok": True, "leaderboard": agents}
+
 
 def _handle_score_award(body):
     """POST /api/projects/scores/award — manually award points."""
@@ -982,18 +1298,19 @@ def _handle_score_award(body):
 
 
 # ── SCORING POINT VALUES ──────────────────────────────────────────────────────
-SCORE_TASK_COMPLETED = 10        # Base points for completing a task
-SCORE_CRITICAL_BONUS = 15       # Extra for critical priority
-SCORE_HIGH_BONUS = 10           # Extra for high priority
-SCORE_MEDIUM_BONUS = 5          # Extra for medium priority
-SCORE_ON_TIME_BONUS = 10        # Extra for completing before due date
-SCORE_CHECKLIST_BONUS = 2       # Per checklist item completed
+SCORE_TASK_COMPLETED = 10  # Base points for completing a task
+SCORE_CRITICAL_BONUS = 15  # Extra for critical priority
+SCORE_HIGH_BONUS = 10  # Extra for high priority
+SCORE_MEDIUM_BONUS = 5  # Extra for medium priority
+SCORE_ON_TIME_BONUS = 10  # Extra for completing before due date
+SCORE_CHECKLIST_BONUS = 2  # Per checklist item completed
 
 
 # ─── PROJECTS API ────────────────────────────────────────────────────────────
 ##############################################################################
 
 _PROJECTS_FILE_LOCK = threading.Lock()
+
 
 def _load_projects():
     """Load projects from the markdown-backed store."""
@@ -1044,8 +1361,16 @@ _BUILTIN_TEMPLATES = [
             {"title": "Done", "color": "#198754"},
         ],
         "taskTemplates": [
-            {"title": "Set up development environment", "columnIndex": 0, "priority": "high"},
-            {"title": "Define acceptance criteria", "columnIndex": 0, "priority": "medium"},
+            {
+                "title": "Set up development environment",
+                "columnIndex": 0,
+                "priority": "high",
+            },
+            {
+                "title": "Define acceptance criteria",
+                "columnIndex": 0,
+                "priority": "medium",
+            },
             {"title": "Write unit tests", "columnIndex": 0, "priority": "medium"},
         ],
     },
@@ -1063,7 +1388,11 @@ _BUILTIN_TEMPLATES = [
         ],
         "taskTemplates": [
             {"title": "Define target audience", "columnIndex": 0, "priority": "high"},
-            {"title": "Create content calendar", "columnIndex": 0, "priority": "medium"},
+            {
+                "title": "Create content calendar",
+                "columnIndex": 0,
+                "priority": "medium",
+            },
         ],
     },
     {
@@ -1098,6 +1427,7 @@ _BUILTIN_TEMPLATES = [
 
 # ── GET handlers ──────────────────────────────────────────────────────────────
 
+
 def _handle_projects_list(query_string=""):
     """GET /api/projects — return all projects (summaries)."""
     data = _load_projects()
@@ -1116,23 +1446,25 @@ def _handle_projects_list(query_string=""):
         tasks = p.get("tasks", [])
         total = len(tasks)
         done = sum(1 for t in tasks if t.get("completedAt"))
-        summaries.append({
-            "id": p["id"],
-            "title": p.get("title", ""),
-            "description": p.get("description", ""),
-            "status": p.get("status", "active"),
-            "priority": p.get("priority", "medium"),
-            "createdAt": p.get("createdAt", ""),
-            "updatedAt": p.get("updatedAt", ""),
-            "dueDate": p.get("dueDate"),
-            "createdBy": p.get("createdBy", ""),
-            "tags": p.get("tags", []),
-            "branch": p.get("branch", ""),
-            "columns": p.get("columns", []),
-            "taskCount": total,
-            "taskDone": done,
-            "template": p.get("template", False),
-        })
+        summaries.append(
+            {
+                "id": p["id"],
+                "title": p.get("title", ""),
+                "description": p.get("description", ""),
+                "status": p.get("status", "active"),
+                "priority": p.get("priority", "medium"),
+                "createdAt": p.get("createdAt", ""),
+                "updatedAt": p.get("updatedAt", ""),
+                "dueDate": p.get("dueDate"),
+                "createdBy": p.get("createdBy", ""),
+                "tags": p.get("tags", []),
+                "branch": p.get("branch", ""),
+                "columns": p.get("columns", []),
+                "taskCount": total,
+                "taskDone": done,
+                "template": p.get("template", False),
+            }
+        )
     return {"ok": True, "projects": summaries}
 
 
@@ -1160,6 +1492,7 @@ def _handle_project_report(project_id):
         return {"error": "Project not found", "_status": 404}
     tasks = p.get("tasks", [])
     now_str = _proj_now()
+
     def _is_overdue(t):
         dd = t.get("dueDate")
         if not dd or t.get("completedAt"):
@@ -1169,16 +1502,29 @@ def _handle_project_report(project_id):
             return due < datetime.now(timezone.utc)
         except Exception:
             return False
+
     total = len(tasks)
     done = sum(1 for t in tasks if t.get("completedAt"))
-    in_progress_cols = [c["id"] for c in p.get("columns", []) if "progress" in c.get("title", "").lower() or "doing" in c.get("title", "").lower()]
+    in_progress_cols = [
+        c["id"]
+        for c in p.get("columns", [])
+        if "progress" in c.get("title", "").lower()
+        or "doing" in c.get("title", "").lower()
+    ]
     in_progress = sum(1 for t in tasks if t.get("columnId") in in_progress_cols)
     overdue = sum(1 for t in tasks if _is_overdue(t))
     # Per-column breakdown
     col_stats = []
     for col in p.get("columns", []):
         col_tasks = [t for t in tasks if t.get("columnId") == col["id"]]
-        col_stats.append({"id": col["id"], "title": col["title"], "color": col.get("color", "#666"), "count": len(col_tasks)})
+        col_stats.append(
+            {
+                "id": col["id"],
+                "title": col["title"],
+                "color": col.get("color", "#666"),
+                "count": len(col_tasks),
+            }
+        )
     # Agent workload
     agent_load = {}
     for t in tasks:
@@ -1188,20 +1534,38 @@ def _handle_project_report(project_id):
     timeline = []
     for t in tasks:
         if t.get("dueDate"):
-            timeline.append({"id": t["id"], "title": t["title"], "dueDate": t["dueDate"], "completedAt": t.get("completedAt"), "assignee": t.get("assignee"), "priority": t.get("priority", "medium")})
+            timeline.append(
+                {
+                    "id": t["id"],
+                    "title": t["title"],
+                    "dueDate": t["dueDate"],
+                    "completedAt": t.get("completedAt"),
+                    "assignee": t.get("assignee"),
+                    "priority": t.get("priority", "medium"),
+                }
+            )
     timeline.sort(key=lambda x: x["dueDate"])
-    return {"ok": True, "report": {
-        "projectId": project_id,
-        "title": p.get("title", ""),
-        "generatedAt": now_str,
-        "stats": {"total": total, "done": done, "inProgress": in_progress, "overdue": overdue},
-        "columns": col_stats,
-        "agentWorkload": agent_load,
-        "timeline": timeline,
-    }}
+    return {
+        "ok": True,
+        "report": {
+            "projectId": project_id,
+            "title": p.get("title", ""),
+            "generatedAt": now_str,
+            "stats": {
+                "total": total,
+                "done": done,
+                "inProgress": in_progress,
+                "overdue": overdue,
+            },
+            "columns": col_stats,
+            "agentWorkload": agent_load,
+            "timeline": timeline,
+        },
+    }
 
 
 # ── POST handlers ─────────────────────────────────────────────────────────────
+
 
 def _handle_project_create(body):
     """POST /api/projects — create a new project."""
@@ -1256,7 +1620,13 @@ def _handle_task_create(project_id, body):
     if not col_id and p.get("columns"):
         col_id = p["columns"][0]["id"]
     # Max order in column
-    max_order = max((t.get("order", 0) for t in p["tasks"] if t.get("columnId") == col_id), default=-1) + 1
+    max_order = (
+        max(
+            (t.get("order", 0) for t in p["tasks"] if t.get("columnId") == col_id),
+            default=-1,
+        )
+        + 1
+    )
     now = _proj_now()
     task = {
         "id": _proj_uuid(),
@@ -1282,8 +1652,15 @@ def _handle_task_create(project_id, body):
     _log_activity(p, "task_created", by, f"Created task '{title}'", task["id"])
     _save_projects(data)
     # Create task markdown file at creation time
-    col_title = next((c["title"] for c in p.get("columns", []) if c["id"] == col_id), "backlog")
-    _wf_write_task_file(project_id, task, col_title.lower().replace(" ", "_"), work_log_entry=f"Task created by {by} in '{col_title}'")
+    col_title = next(
+        (c["title"] for c in p.get("columns", []) if c["id"] == col_id), "backlog"
+    )
+    _wf_write_task_file(
+        project_id,
+        task,
+        col_title.lower().replace(" ", "_"),
+        work_log_entry=f"Task created by {by} in '{col_title}'",
+    )
     return {"ok": True, "task": task}
 
 
@@ -1300,17 +1677,32 @@ def _handle_task_comment(project_id, task_id, body):
     if not text:
         return {"error": "Comment text is required", "_status": 400}
     author = (body.get("author") or "user").strip()
-    comment = {"id": _proj_uuid(), "author": author, "text": text, "createdAt": _proj_now()}
+    comment = {
+        "id": _proj_uuid(),
+        "author": author,
+        "text": text,
+        "createdAt": _proj_now(),
+    }
     if not isinstance(task.get("comments"), list):
         task["comments"] = []
     task["comments"].append(comment)
     task["updatedAt"] = _proj_now()
     p["updatedAt"] = _proj_now()
-    _log_activity(p, "task_commented", author, f"Commented on '{task['title']}'", task_id)
+    _log_activity(
+        p, "task_commented", author, f"Commented on '{task['title']}'", task_id
+    )
     _save_projects(data)
     # Update task markdown file with comment
-    current_col = next((c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")), "unknown")
-    _wf_write_task_file(project_id, task, current_col.lower().replace(" ", "_"), work_log_entry=f"Comment by {author}: {text[:200]}")
+    current_col = next(
+        (c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")),
+        "unknown",
+    )
+    _wf_write_task_file(
+        project_id,
+        task,
+        current_col.lower().replace(" ", "_"),
+        work_log_entry=f"Comment by {author}: {text[:200]}",
+    )
     return {"ok": True, "comment": comment}
 
 
@@ -1334,31 +1726,40 @@ def _handle_project_from_template(body):
     for i, col in enumerate(tpl.get("columns", [])):
         new_id = _proj_uuid()
         col_map[i] = new_id
-        new_cols.append({"id": new_id, "title": col.get("title", f"Column {i+1}"), "color": col.get("color", "#6c757d"), "order": i})
+        new_cols.append(
+            {
+                "id": new_id,
+                "title": col.get("title", f"Column {i + 1}"),
+                "color": col.get("color", "#6c757d"),
+                "order": i,
+            }
+        )
     # Create tasks from taskTemplates
     new_tasks = []
     for tt in tpl.get("taskTemplates", []):
         col_idx = tt.get("columnIndex", 0)
         col_id = col_map.get(col_idx, new_cols[0]["id"] if new_cols else None)
         if col_id:
-            new_tasks.append({
-                "id": _proj_uuid(),
-                "title": tt.get("title", "Task"),
-                "description": tt.get("description", ""),
-                "columnId": col_id,
-                "order": tt.get("order", 0),
-                "priority": tt.get("priority", "medium"),
-                "assignee": None,
-                "assigneeBranch": None,
-                "dueDate": None,
-                "tags": tt.get("tags", []),
-                "checklist": [],
-                "comments": [],
-                "attachments": [],
-                "createdAt": now,
-                "updatedAt": now,
-                "completedAt": None,
-            })
+            new_tasks.append(
+                {
+                    "id": _proj_uuid(),
+                    "title": tt.get("title", "Task"),
+                    "description": tt.get("description", ""),
+                    "columnId": col_id,
+                    "order": tt.get("order", 0),
+                    "priority": tt.get("priority", "medium"),
+                    "assignee": None,
+                    "assigneeBranch": None,
+                    "dueDate": None,
+                    "tags": tt.get("tags", []),
+                    "checklist": [],
+                    "comments": [],
+                    "attachments": [],
+                    "createdAt": now,
+                    "updatedAt": now,
+                    "completedAt": None,
+                }
+            )
     created_by = (body.get("createdBy") or "user").strip()
     project = {
         "id": _proj_uuid(),
@@ -1377,7 +1778,12 @@ def _handle_project_from_template(body):
         "activity": [],
         "template": False,
     }
-    _log_activity(project, "project_created", created_by, f"Created from template '{tpl.get('title', '')}'")
+    _log_activity(
+        project,
+        "project_created",
+        created_by,
+        f"Created from template '{tpl.get('title', '')}'",
+    )
     data["projects"].append(project)
     _save_projects(data)
     return {"ok": True, "project": project}
@@ -1397,18 +1803,23 @@ def _handle_save_as_template(body):
     if p:
         col_idx_map = {col["id"]: i for i, col in enumerate(p.get("columns", []))}
         for t in p.get("tasks", []):
-            task_templates.append({
-                "title": t.get("title", ""),
-                "columnIndex": col_idx_map.get(t.get("columnId", ""), 0),
-                "priority": t.get("priority", "medium"),
-                "tags": t.get("tags", []),
-                "description": t.get("description", ""),
-            })
+            task_templates.append(
+                {
+                    "title": t.get("title", ""),
+                    "columnIndex": col_idx_map.get(t.get("columnId", ""), 0),
+                    "priority": t.get("priority", "medium"),
+                    "tags": t.get("tags", []),
+                    "description": t.get("description", ""),
+                }
+            )
     template = {
         "id": _proj_uuid(),
         "title": title,
         "description": body.get("description", p.get("description", "") if p else ""),
-        "columns": [{"title": c.get("title"), "color": c.get("color", "#6c757d")} for c in (p.get("columns", []) if p else [])],
+        "columns": [
+            {"title": c.get("title"), "color": c.get("color", "#6c757d")}
+            for c in (p.get("columns", []) if p else [])
+        ],
         "taskTemplates": task_templates,
     }
     if not isinstance(data.get("templates"), list):
@@ -1420,6 +1831,7 @@ def _handle_save_as_template(body):
 
 # ── PUT handlers ──────────────────────────────────────────────────────────────
 
+
 def _handle_project_update(project_id, body):
     """PUT /api/projects/{id} — update project metadata."""
     data = _load_projects()
@@ -1427,13 +1839,23 @@ def _handle_project_update(project_id, body):
     if not p:
         return {"error": "Project not found", "_status": 404}
     by = body.get("by", "user")
-    updatable = ["title", "description", "status", "priority", "dueDate", "tags", "branch"]
+    updatable = [
+        "title",
+        "description",
+        "status",
+        "priority",
+        "dueDate",
+        "tags",
+        "branch",
+    ]
     for field in updatable:
         if field in body:
             old = p.get(field)
             p[field] = body[field]
             if old != body[field]:
-                _log_activity(p, "project_updated", by, f"Changed {field}: {old} → {body[field]}")
+                _log_activity(
+                    p, "project_updated", by, f"Changed {field}: {old} → {body[field]}"
+                )
     p["updatedAt"] = _proj_now()
     _save_projects(data)
     return {"ok": True, "project": p}
@@ -1452,10 +1874,25 @@ def _handle_task_update(project_id, task_id, body):
     now = _proj_now()
     # Track column move
     if "columnId" in body and body["columnId"] != task.get("columnId"):
-        old_col = next((c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")), task.get("columnId"))
-        new_col = next((c["title"] for c in p.get("columns", []) if c["id"] == body["columnId"]), body["columnId"])
+        old_col = next(
+            (
+                c["title"]
+                for c in p.get("columns", [])
+                if c["id"] == task.get("columnId")
+            ),
+            task.get("columnId"),
+        )
+        new_col = next(
+            (c["title"] for c in p.get("columns", []) if c["id"] == body["columnId"]),
+            body["columnId"],
+        )
         # Check if moving to "Done" column
-        done_cols = [c["id"] for c in p.get("columns", []) if c.get("title", "").lower() in ("done", "completed", "verified", "published", "fixed", "closed")]
+        done_cols = [
+            c["id"]
+            for c in p.get("columns", [])
+            if c.get("title", "").lower()
+            in ("done", "completed", "verified", "published", "fixed", "closed")
+        ]
         if body["columnId"] in done_cols and not task.get("completedAt"):
             task["completedAt"] = now
             # GAMIFICATION: Award points to assignee
@@ -1463,9 +1900,12 @@ def _handle_task_update(project_id, task_id, body):
             if assignee:
                 pts = SCORE_TASK_COMPLETED
                 pri = task.get("priority", "medium")
-                if pri == "critical": pts += SCORE_CRITICAL_BONUS
-                elif pri == "high": pts += SCORE_HIGH_BONUS
-                elif pri == "medium": pts += SCORE_MEDIUM_BONUS
+                if pri == "critical":
+                    pts += SCORE_CRITICAL_BONUS
+                elif pri == "high":
+                    pts += SCORE_HIGH_BONUS
+                elif pri == "medium":
+                    pts += SCORE_MEDIUM_BONUS
                 # On-time bonus
                 dd = task.get("dueDate")
                 if dd:
@@ -1479,18 +1919,46 @@ def _handle_task_update(project_id, task_id, body):
                 chk = task.get("checklist", [])
                 done_items = sum(1 for c in chk if c.get("done"))
                 pts += done_items * SCORE_CHECKLIST_BONUS
-                score_result = _award_points(assignee, pts, f"Completed: {task.get('title','')}")
+                score_result = _award_points(
+                    assignee, pts, f"Completed: {task.get('title', '')}"
+                )
                 task["_scoreAwarded"] = score_result  # Transient field for response
         elif body["columnId"] not in done_cols and task.get("completedAt"):
             task["completedAt"] = None
-        _log_activity(p, "task_moved", by, f"Moved '{task['title']}' from {old_col} to {new_col}", task_id)
+        _log_activity(
+            p,
+            "task_moved",
+            by,
+            f"Moved '{task['title']}' from {old_col} to {new_col}",
+            task_id,
+        )
     # Track priority change
     if "priority" in body and body["priority"] != task.get("priority"):
-        _log_activity(p, "task_priority_changed", by, f"Priority changed: {task.get('priority')} → {body['priority']}", task_id)
+        _log_activity(
+            p,
+            "task_priority_changed",
+            by,
+            f"Priority changed: {task.get('priority')} → {body['priority']}",
+            task_id,
+        )
     # Track assignee change
     if "assignee" in body and body["assignee"] != task.get("assignee"):
-        _log_activity(p, "task_assigned", by, f"Assigned to {body['assignee']}", task_id)
-    updatable = ["title", "description", "columnId", "order", "priority", "assignee", "assigneeBranch", "dueDate", "tags", "checklist", "completedAt"]
+        _log_activity(
+            p, "task_assigned", by, f"Assigned to {body['assignee']}", task_id
+        )
+    updatable = [
+        "title",
+        "description",
+        "columnId",
+        "order",
+        "priority",
+        "assignee",
+        "assigneeBranch",
+        "dueDate",
+        "tags",
+        "checklist",
+        "completedAt",
+    ]
     # Track which fields changed for md file update
     changed_fields = []
     for field in updatable:
@@ -1503,7 +1971,14 @@ def _handle_task_update(project_id, task_id, body):
     _save_projects(data)
     # Update task markdown file on meaningful changes
     if changed_fields:
-        current_col = next((c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")), "unknown")
+        current_col = next(
+            (
+                c["title"]
+                for c in p.get("columns", [])
+                if c["id"] == task.get("columnId")
+            ),
+            "unknown",
+        )
         status_text = current_col.lower().replace(" ", "_")
         log_parts = []
         if "columnId" in changed_fields:
@@ -1512,11 +1987,20 @@ def _handle_task_update(project_id, task_id, body):
             log_parts.append(f"Assigned to {task.get('assignee', 'unassigned')}")
         if "priority" in changed_fields:
             log_parts.append(f"Priority set to {task.get('priority')}")
-        if any(f in changed_fields for f in ("title", "description", "checklist", "tags", "dueDate")):
+        if any(
+            f in changed_fields
+            for f in ("title", "description", "checklist", "tags", "dueDate")
+        ):
             log_parts.append(f"Updated by {by}")
         work_log_entry = "; ".join(log_parts) if log_parts else f"Updated by {by}"
         review_results = task.get("reviewCheck") if task.get("reviewCheck") else None
-        _wf_write_task_file(project_id, task, status_text, review_results=review_results, work_log_entry=work_log_entry)
+        _wf_write_task_file(
+            project_id,
+            task,
+            status_text,
+            review_results=review_results,
+            work_log_entry=work_log_entry,
+        )
     return {"ok": True, "task": task}
 
 
@@ -1552,7 +2036,12 @@ def _handle_tasks_reorder(project_id, body):
     # Also accept body.tasks as alias for updates (frontend compat)
     updates = body.get("updates", body.get("tasks", []))
     task_map = {t["id"]: t for t in p["tasks"]}
-    done_cols = {c["id"] for c in p.get("columns", []) if c.get("title", "").lower() in ("done", "completed", "verified", "published", "fixed", "closed")}
+    done_cols = {
+        c["id"]
+        for c in p.get("columns", [])
+        if c.get("title", "").lower()
+        in ("done", "completed", "verified", "published", "fixed", "closed")
+    }
     now = _proj_now()
     for u in updates:
         tid = u.get("id")
@@ -1575,6 +2064,7 @@ def _handle_tasks_reorder(project_id, body):
 
 
 # ── DELETE handlers ───────────────────────────────────────────────────────────
+
 
 def _handle_project_delete(project_id):
     """DELETE /api/projects/{id}."""
@@ -1614,6 +2104,7 @@ _WORKFLOW_LOCK = threading.Lock()
 # Legacy task markdown files directory (kept for backward compatibility if present)
 TASK_FILES_DIR = os.path.join(STATUS_DIR, "project-tasks")
 
+
 def _wf_find_column(project, title_lower):
     """Find a column by title (case-insensitive). Tries exact match first, then contains."""
     cols = project.get("columns", [])
@@ -1626,6 +2117,7 @@ def _wf_find_column(project, title_lower):
         if title_lower in col.get("title", "").lower():
             return col
     return None
+
 
 def _wf_get_backlog_col(project):
     """Find the backlog/source column. Tries 'backlog' first, then common alternatives."""
@@ -1644,9 +2136,17 @@ def _wf_get_backlog_col(project):
         return sorted_cols[0]
     return None
 
+
 def _wf_get_inprogress_col(project):
     """Find the in-progress/work column. Tries common names, falls back to second column."""
-    for name in ("in progress", "in_progress", "sprint", "creating", "writing", "working"):
+    for name in (
+        "in progress",
+        "in_progress",
+        "sprint",
+        "creating",
+        "writing",
+        "working",
+    ):
         col = _wf_find_column(project, name)
         if col:
             return col
@@ -1655,6 +2155,7 @@ def _wf_get_inprogress_col(project):
     if len(cols) >= 3:
         return cols[1]
     return None
+
 
 def _wf_get_review_col(project):
     """Find the review column. Tries common names, falls back to second-to-last column."""
@@ -1667,6 +2168,7 @@ def _wf_get_review_col(project):
     if len(cols) >= 3:
         return cols[-2]
     return None
+
 
 def _wf_get_done_col(project):
     """Find the done/final column. Tries 'done' first, then common alternatives."""
@@ -1684,6 +2186,7 @@ def _wf_get_done_col(project):
         return sorted_cols[-1]
     return None
 
+
 def _wf_next_backlog_task(project):
     """Get highest priority task from backlog column."""
     backlog = _wf_get_backlog_col(project)
@@ -1693,7 +2196,12 @@ def _wf_next_backlog_task(project):
     if not tasks:
         return None
     priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    tasks.sort(key=lambda t: (priority_order.get(t.get("priority", "medium"), 2), t.get("order", 0)))
+    tasks.sort(
+        key=lambda t: (
+            priority_order.get(t.get("priority", "medium"), 2),
+            t.get("order", 0),
+        )
+    )
     return tasks[0]
 
 
@@ -1719,6 +2227,7 @@ def _wf_get_active_task(project):
             return t
     return None
 
+
 def _wf_move_task(project_id, task_id, target_col_id, by="workflow"):
     """Move a task to a target column and persist."""
     data = _load_projects()
@@ -1728,16 +2237,30 @@ def _wf_move_task(project_id, task_id, target_col_id, by="workflow"):
     task = next((t for t in p["tasks"] if t["id"] == task_id), None)
     if not task:
         return None
-    old_col = next((c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")), "?")
-    new_col = next((c["title"] for c in p.get("columns", []) if c["id"] == target_col_id), "?")
+    old_col = next(
+        (c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")),
+        "?",
+    )
+    new_col = next(
+        (c["title"] for c in p.get("columns", []) if c["id"] == target_col_id), "?"
+    )
     task["columnId"] = target_col_id
     # Max order in target column
-    col_tasks = [t for t in p["tasks"] if t.get("columnId") == target_col_id and t["id"] != task_id]
+    col_tasks = [
+        t
+        for t in p["tasks"]
+        if t.get("columnId") == target_col_id and t["id"] != task_id
+    ]
     task["order"] = max((t.get("order", 0) for t in col_tasks), default=-1) + 1
     task["updatedAt"] = _proj_now()
     p["updatedAt"] = _proj_now()
     # Handle done column — match common "final" column names
-    done_cols = [c["id"] for c in p.get("columns", []) if c.get("title", "").lower() in ("done", "completed", "verified", "published", "fixed", "closed")]
+    done_cols = [
+        c["id"]
+        for c in p.get("columns", [])
+        if c.get("title", "").lower()
+        in ("done", "completed", "verified", "published", "fixed", "closed")
+    ]
     if target_col_id in done_cols and not task.get("completedAt"):
         task["completedAt"] = _proj_now()
         # Award points
@@ -1745,18 +2268,28 @@ def _wf_move_task(project_id, task_id, target_col_id, by="workflow"):
         if assignee:
             pts = SCORE_TASK_COMPLETED
             pri = task.get("priority", "medium")
-            if pri == "critical": pts += SCORE_CRITICAL_BONUS
-            elif pri == "high": pts += SCORE_HIGH_BONUS
-            elif pri == "medium": pts += SCORE_MEDIUM_BONUS
+            if pri == "critical":
+                pts += SCORE_CRITICAL_BONUS
+            elif pri == "high":
+                pts += SCORE_HIGH_BONUS
+            elif pri == "medium":
+                pts += SCORE_MEDIUM_BONUS
             chk = task.get("checklist", [])
             done_items = sum(1 for c in chk if c.get("done"))
             pts += done_items * SCORE_CHECKLIST_BONUS
-            _award_points(assignee, pts, f"Completed: {task.get('title','')}")
+            _award_points(assignee, pts, f"Completed: {task.get('title', '')}")
     elif target_col_id not in done_cols:
         task["completedAt"] = None
-    _log_activity(p, "task_moved", by, f"Moved '{task['title']}' from {old_col} to {new_col}", task_id)
+    _log_activity(
+        p,
+        "task_moved",
+        by,
+        f"Moved '{task['title']}' from {old_col} to {new_col}",
+        task_id,
+    )
     _save_projects(data)
     return task
+
 
 def _wf_update_task_field(project_id, task_id, field, value):
     """Update a single field on a task and persist."""
@@ -1774,7 +2307,9 @@ def _wf_update_task_field(project_id, task_id, field, value):
     return task
 
 
-def _wf_sync_project_workflow_meta(project_id, *, active=None, phase=None, current_task_id=None, active_agent=None):
+def _wf_sync_project_workflow_meta(
+    project_id, *, active=None, phase=None, current_task_id=None, active_agent=None
+):
     """Mirror live workflow metadata onto the project payload for UI consumers."""
     data = _load_projects()
     p = next((x for x in data["projects"] if x["id"] == project_id), None)
@@ -1792,25 +2327,32 @@ def _wf_sync_project_workflow_meta(project_id, *, active=None, phase=None, curre
     _save_projects(data)
     return p
 
-def _wf_write_task_file(project_id, task, status_text, review_results=None, work_log_entry=None):
+
+def _wf_write_task_file(
+    project_id, task, status_text, review_results=None, work_log_entry=None
+):
     """Update canonical markdown-backed task state, preserving compatibility with workflow logging."""
     data = _load_projects()
     p = next((x for x in data["projects"] if x["id"] == project_id), None)
     if not p:
         return
-    live_task = next((t for t in p.get("tasks", []) if t.get("id") == task.get("id")), None)
+    live_task = next(
+        (t for t in p.get("tasks", []) if t.get("id") == task.get("id")), None
+    )
     if not live_task:
         return
     if review_results is not None:
         live_task["reviewCheck"] = review_results
     if work_log_entry:
         comments = live_task.setdefault("comments", [])
-        comments.append({
-            "id": _proj_uuid(),
-            "author": "workflow",
-            "text": work_log_entry,
-            "createdAt": _proj_now(),
-        })
+        comments.append(
+            {
+                "id": _proj_uuid(),
+                "author": "workflow",
+                "text": work_log_entry,
+                "createdAt": _proj_now(),
+            }
+        )
         if len(comments) > 200:
             live_task["comments"] = comments[-200:]
     live_task["updatedAt"] = _proj_now()
@@ -1838,10 +2380,17 @@ def _wf_read_task_file(project_id, task_id):
     ]
     checklist = task.get("checklist", [])
     if checklist:
-        review_map = {item.get('text', ''): item.get('status', '') for item in (task.get('reviewCheck') or [])}
+        review_map = {
+            item.get("text", ""): item.get("status", "")
+            for item in (task.get("reviewCheck") or [])
+        }
         for item in checklist:
             check = "x" if item.get("done") else " "
-            suffix = f" — {review_map.get(item.get('text', ''), '')}" if review_map.get(item.get('text', '')) else ""
+            suffix = (
+                f" — {review_map.get(item.get('text', ''), '')}"
+                if review_map.get(item.get("text", ""))
+                else ""
+            )
             lines.append(f"- [{check}] {item.get('text', '')}{suffix}")
     else:
         lines.append("- No checklist items")
@@ -1849,7 +2398,9 @@ def _wf_read_task_file(project_id, task_id):
     if comments:
         lines.extend(["", "## Work Log"])
         for comment in comments[-20:]:
-            lines.append(f"### {comment.get('createdAt', '')} — {comment.get('author', 'user')}")
+            lines.append(
+                f"### {comment.get('createdAt', '')} — {comment.get('author', 'user')}"
+            )
             lines.append(comment.get("text", ""))
             lines.append("")
     return "\n".join(lines).strip() + "\n"
@@ -1920,7 +2471,9 @@ def _wf_extract_session_activity(agent_id, project_id, task_id):
       browser_actions: list of browser actions taken
       tool_call_count: total number of tool calls
     """
-    home_path = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
+    home_path = VO_CONFIG.get("openclaw", {}).get(
+        "homePath", os.path.expanduser("~/.openclaw")
+    )
     sessions_dir = os.path.join(home_path, "agents", agent_id, "sessions")
     sessions_json_path = os.path.join(sessions_dir, "sessions.json")
     session_key = _wf_task_session_key(agent_id, project_id, task_id)
@@ -1974,7 +2527,13 @@ def _wf_extract_session_activity(agent_id, project_id, task_id):
                     name = c.get("name", "")
                     args = c.get("arguments", {})
                     # Extract file path from various param names
-                    fpath = args.get("path") or args.get("file") or args.get("filePath") or args.get("file_path") or ""
+                    fpath = (
+                        args.get("path")
+                        or args.get("file")
+                        or args.get("filePath")
+                        or args.get("file_path")
+                        or ""
+                    )
 
                     if name.lower() in ("read",):
                         if fpath and fpath not in seen_files_read:
@@ -1993,7 +2552,10 @@ def _wf_extract_session_activity(agent_id, project_id, task_id):
                         if cmd:
                             activity["exec_commands"].append(cmd[:200])
                             browser_desc = _wf_browser_exec_action_desc(cmd)
-                            if browser_desc and browser_desc not in seen_browser_actions:
+                            if (
+                                browser_desc
+                                and browser_desc not in seen_browser_actions
+                            ):
                                 seen_browser_actions.add(browser_desc)
                                 activity["browser_actions"].append(browser_desc)
                     elif name.lower() == "browser":
@@ -2018,7 +2580,9 @@ def _wf_format_activity_summary(activity):
     lines = []
 
     if activity["tool_call_count"] == 0:
-        lines.append("⚠️ NO TOOL CALLS DETECTED — agent produced text only, no real changes made.")
+        lines.append(
+            "⚠️ NO TOOL CALLS DETECTED — agent produced text only, no real changes made."
+        )
         return "\n".join(lines)
 
     lines.append(f"**Tool calls:** {activity['tool_call_count']}")
@@ -2039,7 +2603,9 @@ def _wf_format_activity_summary(activity):
             lines.append(f"  - `{f}`")
 
     if activity["browser_actions"]:
-        lines.append(f"\n**Browser verification ({len(activity['browser_actions'])}):**")
+        lines.append(
+            f"\n**Browser verification ({len(activity['browser_actions'])}):**"
+        )
         for b in activity["browser_actions"]:
             lines.append(f"  - {b}")
 
@@ -2068,7 +2634,9 @@ def _wf_abort_task_session(session_key):
             origin = f"http://127.0.0.1:{PORT}"
             token = _get_gateway_token()
             if not token:
-                print(f"[WORKFLOW] No gateway token — skipping session abort for {session_key}")
+                print(
+                    f"[WORKFLOW] No gateway token — skipping session abort for {session_key}"
+                )
                 return False
 
             import websockets as _ws
@@ -2094,19 +2662,29 @@ def _wf_abort_task_session(session_key):
                         "id": "wf-abort-1",
                         "method": "connect",
                         "params": {
-                            "minProtocol": 3, "maxProtocol": 3,
-                            "client": {"id": "vo-workflow", "version": "1.0", "platform": "server", "mode": "webchat"},
+                            "minProtocol": 3,
+                            "maxProtocol": 3,
+                            "client": {
+                                "id": "vo-workflow",
+                                "version": "1.0",
+                                "platform": "server",
+                                "mode": "webchat",
+                            },
                             "role": "operator",
                             "scopes": ["operator.read", "operator.write"],
-                            "caps": [], "commands": [], "permissions": {},
-                            "auth": {"token": token}
-                        }
+                            "caps": [],
+                            "commands": [],
+                            "permissions": {},
+                            "auth": {"token": token},
+                        },
                     }
                     await ws.send(json.dumps(connect_msg))
                     raw2 = await _asyncio.wait_for(ws.recv(), timeout=5)
                     res = json.loads(raw2)
                     if not res.get("ok"):
-                        print(f"[WORKFLOW] Gateway auth failed for session abort: {res.get('error', {}).get('message', 'unknown')}")
+                        print(
+                            f"[WORKFLOW] Gateway auth failed for session abort: {res.get('error', {}).get('message', 'unknown')}"
+                        )
                         return False
 
                     # Send chat.abort targeting ONLY this session key
@@ -2114,9 +2692,7 @@ def _wf_abort_task_session(session_key):
                         "type": "req",
                         "id": "wf-abort-2",
                         "method": "chat.abort",
-                        "params": {
-                            "sessionKey": session_key
-                        }
+                        "params": {"sessionKey": session_key},
                     }
                     await ws.send(json.dumps(abort_msg))
                     raw3 = await _asyncio.wait_for(ws.recv(), timeout=5)
@@ -2126,7 +2702,9 @@ def _wf_abort_task_session(session_key):
                         return True
                     else:
                         err = res3.get("error", {}).get("message", "unknown")
-                        print(f"[WORKFLOW] Gateway session abort response: {err} (key={session_key})")
+                        print(
+                            f"[WORKFLOW] Gateway session abort response: {err} (key={session_key})"
+                        )
                         return False
 
         except Exception as e:
@@ -2136,6 +2714,7 @@ def _wf_abort_task_session(session_key):
     try:
         loop = _asyncio.get_running_loop()
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(_asyncio.run, _do_abort())
             return future.result(timeout=20)
@@ -2158,7 +2737,9 @@ def _wf_delete_session_via_gateway(session_key):
             origin = f"http://127.0.0.1:{PORT}"
             token = _get_gateway_token()
             if not token:
-                print(f"[WORKFLOW] No gateway token — skipping session delete via gateway for {session_key}")
+                print(
+                    f"[WORKFLOW] No gateway token — skipping session delete via gateway for {session_key}"
+                )
                 return False
 
             import websockets as _ws
@@ -2184,19 +2765,29 @@ def _wf_delete_session_via_gateway(session_key):
                         "id": "wf-cleanup-1",
                         "method": "connect",
                         "params": {
-                            "minProtocol": 3, "maxProtocol": 3,
-                            "client": {"id": "vo-workflow", "version": "1.0", "platform": "server", "mode": "webchat"},
+                            "minProtocol": 3,
+                            "maxProtocol": 3,
+                            "client": {
+                                "id": "vo-workflow",
+                                "version": "1.0",
+                                "platform": "server",
+                                "mode": "webchat",
+                            },
                             "role": "operator",
                             "scopes": ["operator.read", "operator.write"],
-                            "caps": [], "commands": [], "permissions": {},
-                            "auth": {"token": token}
-                        }
+                            "caps": [],
+                            "commands": [],
+                            "permissions": {},
+                            "auth": {"token": token},
+                        },
                     }
                     await ws.send(json.dumps(connect_msg))
                     raw2 = await _asyncio.wait_for(ws.recv(), timeout=5)
                     res = json.loads(raw2)
                     if not res.get("ok"):
-                        print(f"[WORKFLOW] Gateway auth failed for session delete: {res.get('error', {}).get('message', 'unknown')}")
+                        print(
+                            f"[WORKFLOW] Gateway auth failed for session delete: {res.get('error', {}).get('message', 'unknown')}"
+                        )
                         return False
 
                     # Send sessions.delete
@@ -2207,8 +2798,8 @@ def _wf_delete_session_via_gateway(session_key):
                         "params": {
                             "key": session_key,
                             "deleteTranscript": True,
-                            "emitLifecycleHooks": False
-                        }
+                            "emitLifecycleHooks": False,
+                        },
                     }
                     await ws.send(json.dumps(delete_msg))
                     raw3 = await _asyncio.wait_for(ws.recv(), timeout=5)
@@ -2219,7 +2810,9 @@ def _wf_delete_session_via_gateway(session_key):
                     else:
                         # Session may not exist in gateway memory — that's fine
                         err = res3.get("error", {}).get("message", "unknown")
-                        print(f"[WORKFLOW] Gateway session delete response: {err} (key={session_key})")
+                        print(
+                            f"[WORKFLOW] Gateway session delete response: {err} (key={session_key})"
+                        )
                         return False
 
         except Exception as e:
@@ -2233,6 +2826,7 @@ def _wf_delete_session_via_gateway(session_key):
         # Since workflow runs in a sync thread, this shouldn't happen,
         # but handle it gracefully
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(_asyncio.run, _do_delete())
             return future.result(timeout=20)
@@ -2257,7 +2851,9 @@ def _wf_cleanup_task_sessions(agent_id, project_id, task_id):
     _wf_delete_session_via_gateway(session_key)
 
     # Phase 2: Clean up session files on disk
-    home_path = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
+    home_path = VO_CONFIG.get("openclaw", {}).get(
+        "homePath", os.path.expanduser("~/.openclaw")
+    )
     sessions_dir = os.path.join(home_path, "agents", agent_id, "sessions")
     sessions_json_path = os.path.join(sessions_dir, "sessions.json")
 
@@ -2285,7 +2881,9 @@ def _wf_cleanup_task_sessions(agent_id, project_id, task_id):
                 if os.path.exists(fpath):
                     os.remove(fpath)
 
-        print(f"[WORKFLOW] Cleaned up session files for agent={agent_id} task={task_id[:8]}: {session_key}")
+        print(
+            f"[WORKFLOW] Cleaned up session files for agent={agent_id} task={task_id[:8]}: {session_key}"
+        )
     except Exception as e:
         print(f"[WORKFLOW] Session file cleanup error: {e}")
 
@@ -2322,16 +2920,20 @@ def _wf_call_agent_http(agent_id, message, timeout, session_key=None):
     """Try calling agent via gateway /v1/chat/completions. Returns None if not available.
     If session_key is provided, uses it for session routing (enables cleanup later)."""
 
-    gateway_http = VO_CONFIG.get("openclaw", {}).get("gatewayHttp", "http://127.0.0.1:18789")
+    gateway_http = VO_CONFIG.get("openclaw", {}).get(
+        "gatewayHttp", "http://127.0.0.1:18789"
+    )
     token = _get_gateway_token()
     if not token:
         return None
 
     url = f"{gateway_http}/v1/chat/completions"
-    payload = json.dumps({
-        "model": f"openclaw/{agent_id}",
-        "messages": [{"role": "user", "content": message}],
-    })
+    payload = json.dumps(
+        {
+            "model": f"openclaw/{agent_id}",
+            "messages": [{"role": "user", "content": message}],
+        }
+    )
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
@@ -2340,7 +2942,9 @@ def _wf_call_agent_http(agent_id, message, timeout, session_key=None):
         headers["x-openclaw-session-key"] = session_key
 
     try:
-        req = urllib.request.Request(url, data=payload.encode("utf-8"), headers=headers, method="POST")
+        req = urllib.request.Request(
+            url, data=payload.encode("utf-8"), headers=headers, method="POST"
+        )
         with urllib.request.urlopen(req, timeout=timeout + 30) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" not in content_type:
@@ -2373,11 +2977,23 @@ def _wf_call_agent_cli(agent_id, message, timeout, session_key=None):
     if not openclaw_bin:
         return "[ERROR] openclaw CLI not found in PATH"
 
-    cmd = [openclaw_bin, "agent", "--agent", agent_id, "--message", message, "--timeout", str(timeout), "--json"]
+    cmd = [
+        openclaw_bin,
+        "agent",
+        "--agent",
+        agent_id,
+        "--message",
+        message,
+        "--timeout",
+        str(timeout),
+        "--json",
+    ]
     if session_key:
         cmd.extend(["--session-id", session_key])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 60)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 60
+        )
         if result.returncode == 0:
             try:
                 data = json.loads(result.stdout)
@@ -2390,6 +3006,7 @@ def _wf_call_agent_cli(agent_id, message, timeout, session_key=None):
         return "[ERROR] Agent call timed out"
     except Exception as e:
         return f"[ERROR] Agent call failed: {str(e)}"
+
 
 def _wf_build_project_context(project, task):
     """Build project and task metadata context string."""
@@ -2432,10 +3049,10 @@ def _wf_build_task_prompt(task, task_file_content=None, project=None):
 
     return f"""You have been assigned a task. Complete it fully on your own. Do NOT ask for clarification, followups, or user input.
 
-{project_context}TASK: {task.get('title', 'Untitled')}
+{project_context}TASK: {task.get("title", "Untitled")}
 
 DESCRIPTION:
-{task.get('description', 'No description provided.')}
+{task.get("description", "No description provided.")}
 {checklist_text}
 {previous_work}
 
@@ -2451,6 +3068,7 @@ A reviewer will independently verify your work by reading the actual files and b
 
 WARNING: Do NOT run 'docker restart' on this app's container — it will kill the workflow pipeline managing this task. If you need to reload server changes, the app live-mounts /app so file edits take effect on the next HTTP request for static files. For server.py changes that need a process reload, note what needs restarting in your report and the reviewer will handle it."""
 
+
 def _wf_task_needs_visual_review(task):
     """Heuristic: determine whether a task should require browser-based review."""
     parts = [
@@ -2462,15 +3080,49 @@ def _wf_task_needs_visual_review(task):
     hay = "\n".join(parts).lower()
 
     visual_terms = [
-        "ui", "ux", "browser", "page", "screen", "visual", "visually",
-        "frontend", "front-end", "layout", "render", "display", "button",
-        "form", "modal", "panel", "dashboard", "site", "web app", "webapp",
-        "css", "html", "screenshot", "snapshot", "click", "navigation",
-        "animation", "canvas", "view", "viewer", "interactive"
+        "ui",
+        "ux",
+        "browser",
+        "page",
+        "screen",
+        "visual",
+        "visually",
+        "frontend",
+        "front-end",
+        "layout",
+        "render",
+        "display",
+        "button",
+        "form",
+        "modal",
+        "panel",
+        "dashboard",
+        "site",
+        "web app",
+        "webapp",
+        "css",
+        "html",
+        "screenshot",
+        "snapshot",
+        "click",
+        "navigation",
+        "animation",
+        "canvas",
+        "view",
+        "viewer",
+        "interactive",
     ]
     non_visual_terms = [
-        "docs", "documentation", "audit", "analysis", "implementation map",
-        "review evidence", "write-up", "writeup", "readme", "markdown"
+        "docs",
+        "documentation",
+        "audit",
+        "analysis",
+        "implementation map",
+        "review evidence",
+        "write-up",
+        "writeup",
+        "readme",
+        "markdown",
     ]
 
     has_visual = any(term in hay for term in visual_terms)
@@ -2490,18 +3142,30 @@ def _wf_build_review_prompt(task, task_file_content=None, project=None):
             items_text += f"  {i}. {item.get('text', '')}\n"
 
     needs_visual_review = _wf_task_needs_visual_review(task)
-    visual_steps = """
+    visual_steps = (
+        """
 3. Use the browser tool to load the running app/site and visually confirm UI changes are working. Take snapshots.
 4. If you open any browser/session for review, you MUST close it before finishing your review response. Do not leave browser instances running after review.
-5. If you cannot find real file changes for an item, mark it DID_NOT_PASS regardless of what was claimed earlier.""" if needs_visual_review else """
+5. If you cannot find real file changes for an item, mark it DID_NOT_PASS regardless of what was claimed earlier."""
+        if needs_visual_review
+        else """
 3. Use the browser tool only if the task has a real visual/UI surface that can be meaningfully checked in a running app or site.
 4. If you open any browser/session for review, you MUST close it before finishing your review response.
 5. If you cannot find real file changes or real deliverables for an item, mark it DID_NOT_PASS regardless of what was claimed earlier."""
+    )
 
-    pass_line = "- PASS — verified in the actual files AND confirmed working in the browser/app" if needs_visual_review else "- PASS — verified in the actual files and supported by real verification steps (for example read/exec, and browser if applicable)"
-    critical_line = "CRITICAL: You MUST use tools (read, exec, browser) during this review. A text-only review with no tool calls will be considered invalid." if needs_visual_review else "CRITICAL: You MUST use tools during this review. Use read and/or exec for non-visual tasks, and use browser only when the task is visually reviewable. A text-only review with no tool calls will be considered invalid."
+    pass_line = (
+        "- PASS — verified in the actual files AND confirmed working in the browser/app"
+        if needs_visual_review
+        else "- PASS — verified in the actual files and supported by real verification steps (for example read/exec, and browser if applicable)"
+    )
+    critical_line = (
+        "CRITICAL: You MUST use tools (read, exec, browser) during this review. A text-only review with no tool calls will be considered invalid."
+        if needs_visual_review
+        else "CRITICAL: You MUST use tools during this review. Use read and/or exec for non-visual tasks, and use browser only when the task is visually reviewable. A text-only review with no tool calls will be considered invalid."
+    )
 
-    return f"""{project_context}Review your completed work on: {task.get('title', 'Untitled')}
+    return f"""{project_context}Review your completed work on: {task.get("title", "Untitled")}
 
 You must INDEPENDENTLY VERIFY each checklist item. Do NOT trust your previous claims — verify by actually checking.
 
@@ -2528,6 +3192,7 @@ Checklist items to review:
 
 {critical_line}"""
 
+
 def _wf_build_rework_prompt(task, failed_items, task_file_content=None, project=None):
     """Build a rework prompt for failed review items."""
     # project context not repeated in rework — agent already has it from the same session
@@ -2539,7 +3204,7 @@ def _wf_build_rework_prompt(task, failed_items, task_file_content=None, project=
     if task_file_content:
         previous_work = f"\n\n--- PREVIOUS WORK LOG ---\n{task_file_content}\n--- END PREVIOUS WORK LOG ---"
 
-    return f"""These items need more work on: {task.get('title', 'Untitled')}
+    return f"""These items need more work on: {task.get("title", "Untitled")}
 
 The following checklist items did NOT pass review. Fix them yourself. Do not ask for help.
 
@@ -2556,6 +3221,7 @@ MANDATORY RULES:
 6. In your report, list EVERY file you modified and what you changed.
 
 A reviewer will independently verify your fixes by reading the actual files and browsing the app."""
+
 
 def _wf_review_had_structured_match(review_results):
     """Check if any review results came from structured line parsing (not defaults/fallbacks).
@@ -2615,7 +3281,7 @@ def _wf_parse_review_response(response_text, checklist, review_cycle=0):
         # Accept lines with REVIEW_ITEM_, numbered items, or containing a status keyword
         is_review_line = (
             "review_item" in line_lower
-            or re.match(r'^\d+[\.\):\s]', line_stripped)
+            or re.match(r"^\d+[\.\):\s]", line_stripped)
             or "item " in line_lower
         )
 
@@ -2626,23 +3292,27 @@ def _wf_parse_review_response(response_text, checklist, review_cycle=0):
                 break
 
         if matched_status and (is_review_line or item_idx == 0 or len(checklist) == 1):
-            results.append({
-                "id": checklist[item_idx].get("id"),
-                "text": checklist[item_idx].get("text", ""),
-                "status": matched_status,
-                "_parsed": True,
-            })
+            results.append(
+                {
+                    "id": checklist[item_idx].get("id"),
+                    "text": checklist[item_idx].get("text", ""),
+                    "status": matched_status,
+                    "_parsed": True,
+                }
+            )
             item_idx += 1
         elif matched_status and not is_review_line:
             # Heuristic: if we're already matching items and this line has a status,
             # it's probably a continuation
             if len(results) > 0:
-                results.append({
-                    "id": checklist[item_idx].get("id"),
-                    "text": checklist[item_idx].get("text", ""),
-                    "status": matched_status,
-                    "_parsed": True,
-                })
+                results.append(
+                    {
+                        "id": checklist[item_idx].get("id"),
+                        "text": checklist[item_idx].get("text", ""),
+                        "status": matched_status,
+                        "_parsed": True,
+                    }
+                )
                 item_idx += 1
 
     # --- Freeform fallback: if no structured lines matched at all ---
@@ -2651,19 +3321,45 @@ def _wf_parse_review_response(response_text, checklist, review_cycle=0):
 
         # Positive sentiment keywords (agent says everything is good)
         positive_keywords = [
-            "all items verified", "all items are done", "all items pass",
-            "everything looks good", "everything is working", "all checks pass",
-            "all tasks completed", "all completed", "all done", "looks great",
-            "fully implemented", "all requirements met", "verified and working",
-            "all items look good", "no issues found", "nothing to fix",
-            "approved", "lgtm", "ship it",
+            "all items verified",
+            "all items are done",
+            "all items pass",
+            "everything looks good",
+            "everything is working",
+            "all checks pass",
+            "all tasks completed",
+            "all completed",
+            "all done",
+            "looks great",
+            "fully implemented",
+            "all requirements met",
+            "verified and working",
+            "all items look good",
+            "no issues found",
+            "nothing to fix",
+            "approved",
+            "lgtm",
+            "ship it",
         ]
         # Negative sentiment keywords (agent says something is wrong)
         negative_keywords = [
-            "needs work", "needs more work", "did not pass", "not working",
-            "failed", "missing", "incomplete", "broken", "issues found",
-            "not implemented", "needs fix", "needs rework", "does not work",
-            "errors", "bugs found", "not done", "partially done",
+            "needs work",
+            "needs more work",
+            "did not pass",
+            "not working",
+            "failed",
+            "missing",
+            "incomplete",
+            "broken",
+            "issues found",
+            "not implemented",
+            "needs fix",
+            "needs rework",
+            "does not work",
+            "errors",
+            "bugs found",
+            "not done",
+            "partially done",
         ]
 
         # Count occurrences of positive vs negative keywords in the response.
@@ -2686,14 +3382,16 @@ def _wf_parse_review_response(response_text, checklist, review_cycle=0):
             else:
                 fallback_reason = "freeform_no_negatives"
             for i, item in enumerate(checklist):
-                results.append({
-                    "id": item.get("id"),
-                    "text": item.get("text", ""),
-                    "status": "pass",
-                    "_fallback": fallback_reason,
-                    "_positive_count": positive_count,
-                    "_negative_count": negative_count,
-                })
+                results.append(
+                    {
+                        "id": item.get("id"),
+                        "text": item.get("text", ""),
+                        "status": "pass",
+                        "_fallback": fallback_reason,
+                        "_positive_count": positive_count,
+                        "_negative_count": negative_count,
+                    }
+                )
             return results
 
         # Cycle-based fallback: if review_cycle >= 3 and all checklist items
@@ -2702,24 +3400,29 @@ def _wf_parse_review_response(response_text, checklist, review_cycle=0):
             all_checklist_done = all(item.get("done", False) for item in checklist)
             if all_checklist_done:
                 for i, item in enumerate(checklist):
-                    results.append({
-                        "id": item.get("id"),
-                        "text": item.get("text", ""),
-                        "status": "pass",
-                        "_fallback": "cycle_3_checklist_done",
-                    })
+                    results.append(
+                        {
+                            "id": item.get("id"),
+                            "text": item.get("text", ""),
+                            "status": "pass",
+                            "_fallback": "cycle_3_checklist_done",
+                        }
+                    )
                 return results
 
     # If parsing failed or incomplete, default remaining to needs_more_work
     for i in range(len(results), len(checklist)):
-        results.append({
-            "id": checklist[i].get("id"),
-            "text": checklist[i].get("text", ""),
-            "status": "needs_more_work",
-            "_default": True,
-        })
+        results.append(
+            {
+                "id": checklist[i].get("id"),
+                "text": checklist[i].get("text", ""),
+                "status": "needs_more_work",
+                "_default": True,
+            }
+        )
 
     return results
+
 
 def _wf_run_pipeline(project_id, single_task=False):
     """Main workflow pipeline — runs in a background thread."""
@@ -2731,7 +3434,7 @@ def _wf_run_pipeline(project_id, single_task=False):
     stop_flag = wf["stopFlag"]
 
     try:
-      _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag)
+        _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag)
     except Exception as e:
         print(f"[WORKFLOW ERROR] Pipeline crashed for {project_id}: {e}")
         traceback.print_exc()
@@ -2762,10 +3465,18 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             # The pipeline should not start a new task while one is still active.
             with _WORKFLOW_LOCK:
                 wf["phase"] = "blocked_by_active_task"
-                wf["error"] = f"Task '{active_task.get('title', '')}' is still in progress. Backlog tasks will not start until it is fully done or moved to backlog/done."
+                wf["error"] = (
+                    f"Task '{active_task.get('title', '')}' is still in progress. Backlog tasks will not start until it is fully done or moved to backlog/done."
+                )
                 wf["currentTaskId"] = active_task["id"]
                 wf["active"] = False
-            _wf_sync_project_workflow_meta(project_id, active=False, phase="blocked_by_active_task", current_task_id=active_task["id"], active_agent=active_task.get("assignee"))
+            _wf_sync_project_workflow_meta(
+                project_id,
+                active=False,
+                phase="blocked_by_active_task",
+                current_task_id=active_task["id"],
+                active_agent=active_task.get("assignee"),
+            )
             _wf_persist_state(project_id)
             break
 
@@ -2777,7 +3488,13 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                 wf["phase"] = "idle"
                 wf["currentTaskId"] = None
                 wf["active"] = False
-            _wf_sync_project_workflow_meta(project_id, active=False, phase="idle", current_task_id=None, active_agent=None)
+            _wf_sync_project_workflow_meta(
+                project_id,
+                active=False,
+                phase="idle",
+                current_task_id=None,
+                active_agent=None,
+            )
             break
 
         task_id = task["id"]
@@ -2794,7 +3511,13 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             wf["currentTaskId"] = task_id
             wf["phase"] = "dispatching"
             wf["error"] = None
-        _wf_sync_project_workflow_meta(project_id, active=True, phase="dispatching", current_task_id=task_id, active_agent=assignee)
+        _wf_sync_project_workflow_meta(
+            project_id,
+            active=True,
+            phase="dispatching",
+            current_task_id=task_id,
+            active_agent=assignee,
+        )
         _wf_persist_state(project_id)
 
         if stop_flag.is_set():
@@ -2810,7 +3533,9 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             break
 
         _wf_move_task(project_id, task_id, inprogress_col["id"], by="workflow")
-        _wf_write_task_file(project_id, task, "in_progress", work_log_entry="Sent to agent for work")
+        _wf_write_task_file(
+            project_id, task, "in_progress", work_log_entry="Sent to agent for work"
+        )
 
         with _WORKFLOW_LOCK:
             wf["phase"] = "in_progress"
@@ -2826,7 +3551,9 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
 
         task_file = _wf_read_task_file(project_id, task_id)
         prompt = _wf_build_task_prompt(task, task_file, project=project)
-        agent_response = _wf_call_agent(assignee, prompt, project_id=project_id, task_id=task_id)
+        agent_response = _wf_call_agent(
+            assignee, prompt, project_id=project_id, task_id=task_id
+        )
 
         if stop_flag.is_set():
             break
@@ -2834,7 +3561,12 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
         # Update task file with agent response + file activity
         work_activity = _wf_extract_session_activity(assignee, project_id, task_id)
         work_activity_text = _wf_format_activity_summary(work_activity)
-        _wf_write_task_file(project_id, task, "in_progress", work_log_entry=f"Agent response:\n{agent_response[:2000]}\n\n**Activity:**\n{work_activity_text}")
+        _wf_write_task_file(
+            project_id,
+            task,
+            "in_progress",
+            work_log_entry=f"Agent response:\n{agent_response[:2000]}\n\n**Activity:**\n{work_activity_text}",
+        )
 
         # Step 3: Move to Review
         review_col = _wf_get_review_col(project)
@@ -2852,14 +3584,20 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
         review_cycle = 0
         task_done = False
         wf["_parseFailCount"] = 0  # Track consecutive parse failures for safety cap
-        wf["_reworkCount"] = 0     # Track total consecutive rework cycles for safety cap
+        wf["_reworkCount"] = 0  # Track total consecutive rework cycles for safety cap
 
         while review_cycle < max_review_cycles and not stop_flag.is_set():
             review_cycle += 1
             with _WORKFLOW_LOCK:
                 wf["phase"] = "reviewing"
                 wf["reviewCycle"] = review_cycle
-            _wf_sync_project_workflow_meta(project_id, active=True, phase="reviewing", current_task_id=task_id, active_agent=assignee)
+            _wf_sync_project_workflow_meta(
+                project_id,
+                active=True,
+                phase="reviewing",
+                current_task_id=task_id,
+                active_agent=assignee,
+            )
             _wf_persist_state(project_id)
 
             # Reload task for fresh checklist
@@ -2879,19 +3617,31 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
 
             task_file = _wf_read_task_file(project_id, task_id)
             review_prompt = _wf_build_review_prompt(task, task_file, project=project)
-            review_response = _wf_call_agent(assignee, review_prompt, project_id=project_id, task_id=task_id)
+            review_response = _wf_call_agent(
+                assignee, review_prompt, project_id=project_id, task_id=task_id
+            )
 
             if stop_flag.is_set():
                 break
 
             # Parse review results (pass review_cycle for freeform fallback logic)
-            review_results = _wf_parse_review_response(review_response, checklist, review_cycle=review_cycle)
+            review_results = _wf_parse_review_response(
+                review_response, checklist, review_cycle=review_cycle
+            )
 
             # Save review results to task
             _wf_update_task_field(project_id, task_id, "reviewCheck", review_results)
-            review_activity = _wf_extract_session_activity(assignee, project_id, task_id)
+            review_activity = _wf_extract_session_activity(
+                assignee, project_id, task_id
+            )
             review_activity_text = _wf_format_activity_summary(review_activity)
-            _wf_write_task_file(project_id, task, "review", review_results=review_results, work_log_entry=f"Review cycle {review_cycle}:\n{review_response[:2000]}\n\n**Review verification activity:**\n{review_activity_text}")
+            _wf_write_task_file(
+                project_id,
+                task,
+                "review",
+                review_results=review_results,
+                work_log_entry=f"Review cycle {review_cycle}:\n{review_response[:2000]}\n\n**Review verification activity:**\n{review_activity_text}",
+            )
 
             # ── TOOL-CALL VERIFICATION ──────────────────────────────
             # A valid review MUST include actual tool usage to verify the work.
@@ -2905,7 +3655,9 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             review_has_browser = len(review_activity.get("browser_actions", [])) > 0
             task_needs_visual_review = _wf_task_needs_visual_review(task)
             review_verified = review_has_reads or review_has_exec or review_has_browser
-            review_visual_verified = review_has_browser if task_needs_visual_review else True
+            review_visual_verified = (
+                review_has_browser if task_needs_visual_review else True
+            )
 
             # Track whether the original parse had structured matches (before
             # tool-verification may override the result). This is used by the
@@ -2915,23 +3667,37 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
 
             # Check results
             all_pass = all(r.get("status") == "pass" for r in review_results)
-            needs_user = any(r.get("status") == "requires_user_review" for r in review_results)
-            failed_items = [r for r in review_results if r.get("status") in ("needs_more_work", "did_not_pass")]
+            needs_user = any(
+                r.get("status") == "requires_user_review" for r in review_results
+            )
+            failed_items = [
+                r
+                for r in review_results
+                if r.get("status") in ("needs_more_work", "did_not_pass")
+            ]
 
             # Reject reviews that claim all-pass without required verification.
             if all_pass and (not review_verified or not review_visual_verified):
                 all_checklist_done = all(item.get("done", False) for item in checklist)
                 if review_cycle >= 4 and all_checklist_done:
-                    _wf_write_task_file(project_id, task, "review",
-                        work_log_entry=f"⚠️ Review cycle {review_cycle}: accepted without full verification (all checklist items done, cycle limit reached)")
+                    _wf_write_task_file(
+                        project_id,
+                        task,
+                        "review",
+                        work_log_entry=f"⚠️ Review cycle {review_cycle}: accepted without full verification (all checklist items done, cycle limit reached)",
+                    )
                 else:
                     all_pass = False
                     failed_items = review_results
                     reason = "used no tools (read/exec/browser) to verify"
                     if review_verified and not review_visual_verified:
                         reason = "did not use browser verification for a visually reviewable task"
-                    _wf_write_task_file(project_id, task, "review",
-                        work_log_entry=f"❌ Review cycle {review_cycle}: REJECTED — agent claimed PASS but {reason}. {review_tool_count} total tool calls.")
+                    _wf_write_task_file(
+                        project_id,
+                        task,
+                        "review",
+                        work_log_entry=f"❌ Review cycle {review_cycle}: REJECTED — agent claimed PASS but {reason}. {review_tool_count} total tool calls.",
+                    )
 
             if all_pass:
                 wf["_reworkCount"] = 0
@@ -2944,31 +3710,57 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                 with _WORKFLOW_LOCK:
                     wf["phase"] = "awaiting_user_review"
                     wf["error"] = "Task requires user review for some items"
-                _wf_sync_project_workflow_meta(project_id, active=True, phase="awaiting_user_review", current_task_id=task_id, active_agent=assignee)
+                _wf_sync_project_workflow_meta(
+                    project_id,
+                    active=True,
+                    phase="awaiting_user_review",
+                    current_task_id=task_id,
+                    active_agent=assignee,
+                )
                 _wf_persist_state(project_id)
-                _wf_write_task_file(project_id, task, "review", review_results=review_results, work_log_entry="Workflow paused — requires user review")
+                _wf_write_task_file(
+                    project_id,
+                    task,
+                    "review",
+                    review_results=review_results,
+                    work_log_entry="Workflow paused — requires user review",
+                )
                 # Wait until user resolves or stop
                 while not stop_flag.is_set():
                     time.sleep(5)
                     # Check if user resolved review items
                     data = _load_projects()
-                    project = next((x for x in data["projects"] if x["id"] == project_id), None)
+                    project = next(
+                        (x for x in data["projects"] if x["id"] == project_id), None
+                    )
                     if not project:
                         break
-                    task = next((t for t in project["tasks"] if t["id"] == task_id), None)
+                    task = next(
+                        (t for t in project["tasks"] if t["id"] == task_id), None
+                    )
                     if not task:
                         break
                     current_review = task.get("reviewCheck", [])
-                    still_needs_user = any(r.get("status") == "requires_user_review" for r in current_review)
+                    still_needs_user = any(
+                        r.get("status") == "requires_user_review"
+                        for r in current_review
+                    )
                     if not still_needs_user:
                         # User resolved — check if all pass now
-                        all_resolved_pass = all(r.get("status") == "pass" for r in current_review)
+                        all_resolved_pass = all(
+                            r.get("status") == "pass" for r in current_review
+                        )
                         if all_resolved_pass:
                             task_done = True
                             break
                         else:
                             # Some items still need work — continue review loop
-                            failed_items = [r for r in current_review if r.get("status") in ("needs_more_work", "did_not_pass")]
+                            failed_items = [
+                                r
+                                for r in current_review
+                                if r.get("status")
+                                in ("needs_more_work", "did_not_pass")
+                            ]
                             break
                 if task_done or stop_flag.is_set():
                     break
@@ -2997,9 +3789,13 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                 if should_escalate:
                     reason_parts = []
                     if parse_fail_count >= 3:
-                        reason_parts.append(f"parser failed to match structured output for {parse_fail_count} consecutive cycles")
+                        reason_parts.append(
+                            f"parser failed to match structured output for {parse_fail_count} consecutive cycles"
+                        )
                     if rework_count >= 3:
-                        reason_parts.append(f"task has been reworked {rework_count} consecutive times")
+                        reason_parts.append(
+                            f"task has been reworked {rework_count} consecutive times"
+                        )
                     reason = "; ".join(reason_parts)
 
                     with _WORKFLOW_LOCK:
@@ -3009,38 +3805,68 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                             f"The reviewing agent may be responding with freeform text "
                             f"or the task may be stuck. Please review manually."
                         )
-                    _wf_sync_project_workflow_meta(project_id, active=True, phase="awaiting_human_intervention", current_task_id=task_id, active_agent=assignee)
+                    _wf_sync_project_workflow_meta(
+                        project_id,
+                        active=True,
+                        phase="awaiting_human_intervention",
+                        current_task_id=task_id,
+                        active_agent=assignee,
+                    )
                     _wf_persist_state(project_id)
                     _wf_write_task_file(
-                        project_id, task, "review",
+                        project_id,
+                        task,
+                        "review",
                         review_results=review_results,
-                        work_log_entry=f"⚠️ Escalated to user — {reason}. Last response:\n{review_response[:1000]}"
+                        work_log_entry=f"⚠️ Escalated to user — {reason}. Last response:\n{review_response[:1000]}",
                     )
                     break
 
                 # Move back to In Progress for rework
                 with _WORKFLOW_LOCK:
                     wf["phase"] = "reworking"
-                _wf_update_task_field(project_id, task_id, "lastReviewCheck", review_results)
-                _wf_sync_project_workflow_meta(project_id, active=True, phase="reworking", current_task_id=task_id, active_agent=assignee)
+                _wf_update_task_field(
+                    project_id, task_id, "lastReviewCheck", review_results
+                )
+                _wf_sync_project_workflow_meta(
+                    project_id,
+                    active=True,
+                    phase="reworking",
+                    current_task_id=task_id,
+                    active_agent=assignee,
+                )
                 _wf_persist_state(project_id)
 
                 # Clear stale reviewCheck so next cycle starts clean
                 _wf_update_task_field(project_id, task_id, "reviewCheck", [])
 
                 _wf_move_task(project_id, task_id, inprogress_col["id"], by="workflow")
-                _wf_write_task_file(project_id, task, "in_progress", work_log_entry=f"Back to In Progress — {len(failed_items)} items need rework")
+                _wf_write_task_file(
+                    project_id,
+                    task,
+                    "in_progress",
+                    work_log_entry=f"Back to In Progress — {len(failed_items)} items need rework",
+                )
 
                 task_file = _wf_read_task_file(project_id, task_id)
                 rework_prompt = _wf_build_rework_prompt(task, failed_items, task_file)
-                rework_response = _wf_call_agent(assignee, rework_prompt, project_id=project_id, task_id=task_id)
+                rework_response = _wf_call_agent(
+                    assignee, rework_prompt, project_id=project_id, task_id=task_id
+                )
 
                 if stop_flag.is_set():
                     break
 
-                rework_activity = _wf_extract_session_activity(assignee, project_id, task_id)
+                rework_activity = _wf_extract_session_activity(
+                    assignee, project_id, task_id
+                )
                 rework_activity_text = _wf_format_activity_summary(rework_activity)
-                _wf_write_task_file(project_id, task, "in_progress", work_log_entry=f"Rework response:\n{rework_response[:2000]}\n\n**Rework activity:**\n{rework_activity_text}")
+                _wf_write_task_file(
+                    project_id,
+                    task,
+                    "in_progress",
+                    work_log_entry=f"Rework response:\n{rework_response[:2000]}\n\n**Rework activity:**\n{rework_activity_text}",
+                )
 
                 # Move back to Review
                 _wf_move_task(project_id, task_id, review_col["id"], by="workflow")
@@ -3061,13 +3887,19 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
 
                 # Write completion with activity summary
                 completion_entry = f"Task completed — all review checks passed\n\n### Task Completion Summary\n{activity_summary}"
-                _wf_write_task_file(project_id, task, "done", work_log_entry=completion_entry)
+                _wf_write_task_file(
+                    project_id, task, "done", work_log_entry=completion_entry
+                )
 
                 # Mark all checklist items as done
                 data = _load_projects()
-                project = next((x for x in data["projects"] if x["id"] == project_id), None)
+                project = next(
+                    (x for x in data["projects"] if x["id"] == project_id), None
+                )
                 if project:
-                    task = next((t for t in project["tasks"] if t["id"] == task_id), None)
+                    task = next(
+                        (t for t in project["tasks"] if t["id"] == task_id), None
+                    )
                     if task and task.get("checklist"):
                         for item in task["checklist"]:
                             item["done"] = True
@@ -3080,7 +3912,13 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             with _WORKFLOW_LOCK:
                 wf["phase"] = "task_done"
                 wf["currentTaskId"] = None
-            _wf_sync_project_workflow_meta(project_id, active=(not single_task), phase="task_done", current_task_id=None, active_agent=None)
+            _wf_sync_project_workflow_meta(
+                project_id,
+                active=(not single_task),
+                phase="task_done",
+                current_task_id=None,
+                active_agent=None,
+            )
             _wf_persist_state(project_id)
 
             if single_task:
@@ -3096,13 +3934,25 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
             # Task did NOT pass review after max cycles — do NOT pull next backlog task.
             # Keep this task in progress and pause for human intervention.
             _wf_move_task(project_id, task_id, inprogress_col["id"], by="workflow")
-            _wf_write_task_file(project_id, task, "in_progress",
-                work_log_entry=f"Review failed after {max_review_cycles} cycles — paused for human intervention. Backlog tasks will NOT proceed until this task passes or is manually resolved.")
+            _wf_write_task_file(
+                project_id,
+                task,
+                "in_progress",
+                work_log_entry=f"Review failed after {max_review_cycles} cycles — paused for human intervention. Backlog tasks will NOT proceed until this task passes or is manually resolved.",
+            )
 
             with _WORKFLOW_LOCK:
                 wf["phase"] = "awaiting_human_intervention"
-                wf["error"] = f"Task '{task.get('title', '')}' failed review after {max_review_cycles} cycles. Resolve manually or retry."
-            _wf_sync_project_workflow_meta(project_id, active=True, phase="awaiting_human_intervention", current_task_id=task_id, active_agent=assignee)
+                wf["error"] = (
+                    f"Task '{task.get('title', '')}' failed review after {max_review_cycles} cycles. Resolve manually or retry."
+                )
+            _wf_sync_project_workflow_meta(
+                project_id,
+                active=True,
+                phase="awaiting_human_intervention",
+                current_task_id=task_id,
+                active_agent=assignee,
+            )
             _wf_persist_state(project_id)
 
             # Wait until human resolves (moves task to done/backlog, or restarts workflow)
@@ -3110,7 +3960,9 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
                 time.sleep(5)
                 # Check if task was manually moved to done or back to backlog
                 data = _load_projects()
-                project = next((x for x in data["projects"] if x["id"] == project_id), None)
+                project = next(
+                    (x for x in data["projects"] if x["id"] == project_id), None
+                )
                 if not project:
                     break
                 task = next((t for t in project["tasks"] if t["id"] == task_id), None)
@@ -3144,6 +3996,7 @@ def _wf_run_pipeline_inner(project_id, single_task, wf, stop_flag):
 
 
 WORKFLOW_STATE_FILE = os.path.join(STATUS_DIR, "workflow-state.json")
+
 
 def _wf_persist_state(project_id):
     """Persist workflow state to disk so it survives page refreshes and container restarts."""
@@ -3217,6 +4070,7 @@ def _wf_load_persisted_state(project_id):
         pass
     return {}
 
+
 def _wf_clear_persisted_state(project_id):
     """Clear persisted state when workflow ends."""
     try:
@@ -3261,7 +4115,11 @@ def _handle_workflow_chat(project_id):
 
     # If no tracked task, find the most recently active task (in progress or review)
     if not agent_key:
-        ip_cols = [c["id"] for c in p.get("columns", []) if c.get("title", "").lower() in ("in progress", "review", "to do")]
+        ip_cols = [
+            c["id"]
+            for c in p.get("columns", [])
+            if c.get("title", "").lower() in ("in progress", "review", "to do")
+        ]
         active_tasks = [t for t in p.get("tasks", []) if t.get("columnId") in ip_cols]
         if active_tasks:
             active_tasks.sort(key=lambda t: t.get("updatedAt", ""), reverse=True)
@@ -3290,7 +4148,9 @@ def _handle_workflow_chat(project_id):
 def _wf_get_task_session_messages(agent_id, project_id, task_id, max_messages=50):
     """Read messages from the task-specific workflow session JSONL only."""
     session_key = _wf_task_session_key(agent_id, project_id, task_id)
-    home_path = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
+    home_path = VO_CONFIG.get("openclaw", {}).get(
+        "homePath", os.path.expanduser("~/.openclaw")
+    )
     sessions_dir = os.path.join(home_path, "agents", agent_id, "sessions")
     sessions_json_path = os.path.join(sessions_dir, "sessions.json")
 
@@ -3326,7 +4186,7 @@ def _wf_get_task_session_messages(agent_id, project_id, task_id, max_messages=50
         if start > 0:
             nl = tail_data.find("\n")
             if nl >= 0:
-                tail_data = tail_data[nl + 1:]
+                tail_data = tail_data[nl + 1 :]
         for line in tail_data.split("\n"):
             line = line.strip()
             if not line:
@@ -3355,35 +4215,73 @@ def _wf_get_task_session_messages(agent_id, project_id, task_id, max_messages=50
                             # Build a human-readable summary instead of bare tool name
                             summary = name
                             if isinstance(args, dict):
-                                if name in ("read", "Read") and (args.get("file") or args.get("path") or args.get("file_path")):
-                                    fpath = args.get("file") or args.get("path") or args.get("file_path") or ""
+                                if name in ("read", "Read") and (
+                                    args.get("file")
+                                    or args.get("path")
+                                    or args.get("file_path")
+                                ):
+                                    fpath = (
+                                        args.get("file")
+                                        or args.get("path")
+                                        or args.get("file_path")
+                                        or ""
+                                    )
                                     summary = f"Reading {fpath.split('/')[-1] if '/' in fpath else fpath}"
                                 elif name in ("edit", "Edit"):
-                                    fpath = args.get("file") or args.get("path") or args.get("file_path") or ""
+                                    fpath = (
+                                        args.get("file")
+                                        or args.get("path")
+                                        or args.get("file_path")
+                                        or ""
+                                    )
                                     summary = f"Editing {fpath.split('/')[-1] if '/' in fpath else fpath}"
                                 elif name in ("write", "Write"):
-                                    fpath = args.get("file") or args.get("path") or args.get("file_path") or ""
+                                    fpath = (
+                                        args.get("file")
+                                        or args.get("path")
+                                        or args.get("file_path")
+                                        or ""
+                                    )
                                     summary = f"Writing {fpath.split('/')[-1] if '/' in fpath else fpath}"
                                 elif name == "exec":
                                     cmd = args.get("command", "")
                                     summary = f"Running: {cmd[:80]}" if cmd else "exec"
                                 elif name == "web_search":
                                     query = args.get("query", "")
-                                    summary = f"Searching: {query[:60]}" if query else "web_search"
+                                    summary = (
+                                        f"Searching: {query[:60]}"
+                                        if query
+                                        else "web_search"
+                                    )
                                 elif name == "web_fetch":
                                     url = args.get("url", "")
-                                    summary = f"Fetching: {url[:60]}" if url else "web_fetch"
+                                    summary = (
+                                        f"Fetching: {url[:60]}" if url else "web_fetch"
+                                    )
                                 elif name == "browser":
                                     action = args.get("action", "")
-                                    summary = f"Browser: {action}" if action else "browser"
+                                    summary = (
+                                        f"Browser: {action}" if action else "browser"
+                                    )
                                 elif name == "sessions_send":
-                                    target = args.get("sessionKey") or args.get("label") or ""
-                                    summary = f"Messaging: {target[:40]}" if target else "sessions_send"
+                                    target = (
+                                        args.get("sessionKey")
+                                        or args.get("label")
+                                        or ""
+                                    )
+                                    summary = (
+                                        f"Messaging: {target[:40]}"
+                                        if target
+                                        else "sessions_send"
+                                    )
                             tool_info.append({"name": summary, "args_preview": ""})
                         elif c.get("type") == "toolResult":
                             pass  # skip tool results for chat display
             if text or tool_info:
-                m = {"role": role, "timestamp": msg.get("timestamp", entry.get("timestamp", 0))}
+                m = {
+                    "role": role,
+                    "timestamp": msg.get("timestamp", entry.get("timestamp", 0)),
+                }
                 if text:
                     m["text"] = text[:2000]
                 if tool_info:
@@ -3398,7 +4296,9 @@ def _wf_get_task_session_messages(agent_id, project_id, task_id, max_messages=50
 def _wf_is_task_session_active(agent_id, project_id, task_id):
     """Check if the task-specific workflow session is still actively running."""
     session_key = _wf_task_session_key(agent_id, project_id, task_id)
-    home_path = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
+    home_path = VO_CONFIG.get("openclaw", {}).get(
+        "homePath", os.path.expanduser("~/.openclaw")
+    )
     sessions_dir = os.path.join(home_path, "agents", agent_id, "sessions")
     sessions_json_path = os.path.join(sessions_dir, "sessions.json")
 
@@ -3423,7 +4323,10 @@ def _handle_workflow_start(project_id, body=None):
     with _WORKFLOW_LOCK:
         wf = _WORKFLOW_STATE.get(project_id)
         if wf and wf.get("active"):
-            return {"error": "Workflow already running for this project", "_status": 409}
+            return {
+                "error": "Workflow already running for this project",
+                "_status": 409,
+            }
 
         auto_mode = body.get("autoMode", False)
         stop_flag = threading.Event()
@@ -3447,13 +4350,17 @@ def _handle_workflow_start(project_id, body=None):
     p["autoMode"] = auto_mode
     p["updatedAt"] = _proj_now()
     _save_projects(data)
-    _log_activity(p, "workflow_started", "user", f"Workflow started (autoMode: {auto_mode})")
+    _log_activity(
+        p, "workflow_started", "user", f"Workflow started (autoMode: {auto_mode})"
+    )
 
     _wf_persist_state(project_id)
 
     # Launch background thread
     single_task = not auto_mode
-    t = threading.Thread(target=_wf_run_pipeline, args=(project_id, single_task), daemon=True)
+    t = threading.Thread(
+        target=_wf_run_pipeline, args=(project_id, single_task), daemon=True
+    )
     with _WORKFLOW_LOCK:
         wf["thread"] = t
     t.start()
@@ -3495,7 +4402,9 @@ def _handle_workflow_stop(project_id):
     if current_task_id and p:
         task = next((t for t in p.get("tasks", []) if t["id"] == current_task_id), None)
         if task and task.get("assignee"):
-            session_key = _wf_task_session_key(task["assignee"], project_id, current_task_id)
+            session_key = _wf_task_session_key(
+                task["assignee"], project_id, current_task_id
+            )
             _wf_abort_task_session(session_key)
             _wf_cleanup_task_sessions(task["assignee"], project_id, current_task_id)
 
@@ -3545,7 +4454,12 @@ def _handle_workflow_status(project_id):
         persisted_active = False
         persisted["phase"] = persisted.get("phase", "idle")
         # If the phase was a working phase, mark it as stalled
-        if persisted.get("phase") in ("in_progress", "reviewing", "reworking", "dispatching"):
+        if persisted.get("phase") in (
+            "in_progress",
+            "reviewing",
+            "reworking",
+            "dispatching",
+        ):
             persisted["phase"] = "stalled"
 
     active = in_memory_active or persisted_active
@@ -3562,7 +4476,9 @@ def _handle_workflow_status(project_id):
         # Find the assignee for the current task
         task = next((t for t in p.get("tasks", []) if t["id"] == current_task), None)
         if task and task.get("assignee"):
-            session_active = _wf_is_task_session_active(task["assignee"], project_id, current_task)
+            session_active = _wf_is_task_session_active(
+                task["assignee"], project_id, current_task
+            )
             if session_active:
                 # Session is running but workflow state says inactive — the thread
                 # is mid-API-call. Report as active so UI shows progress.
@@ -3575,7 +4491,16 @@ def _handle_workflow_status(project_id):
         "active": active,
         "autoMode": p.get("autoMode", False),
         "currentTaskId": current_task,
-        "activeAgent": next((t.get("assignee") for t in p.get("tasks", []) if t.get("id") == current_task), None) if current_task else None,
+        "activeAgent": next(
+            (
+                t.get("assignee")
+                for t in p.get("tasks", [])
+                if t.get("id") == current_task
+            ),
+            None,
+        )
+        if current_task
+        else None,
         "phase": phase,
         "error": error,
         "reviewCycle": review_cycle,
@@ -3601,8 +4526,17 @@ def _handle_review_check_update(project_id, task_id, body):
     _log_activity(p, "review_updated", by, "Review check updated", task_id)
     _save_projects(data)
     # Update task markdown file with review results
-    current_col = next((c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")), "review")
-    _wf_write_task_file(project_id, task, current_col.lower().replace(" ", "_"), review_results=review_check, work_log_entry=f"Review check updated by {by}")
+    current_col = next(
+        (c["title"] for c in p.get("columns", []) if c["id"] == task.get("columnId")),
+        "review",
+    )
+    _wf_write_task_file(
+        project_id,
+        task,
+        current_col.lower().replace(" ", "_"),
+        review_results=review_check,
+        work_log_entry=f"Review check updated by {by}",
+    )
     return {"ok": True, "task": task}
 
 
@@ -3671,7 +4605,7 @@ def _handle_agent_delete(body):
         return {
             "ok": True,
             "agentId": agent_id,
-            "message": f"Agent '{agent_id}' deleted successfully"
+            "message": f"Agent '{agent_id}' deleted successfully",
         }
 
     except Exception as e:
@@ -3680,6 +4614,7 @@ def _handle_agent_delete(body):
 
 
 ##############################################################################
+
 
 def get_agent_messages(agent_key, max_messages=500):
     """Read recent messages from an agent's active session JSONL."""
@@ -3727,90 +4662,110 @@ def get_agent_messages(agent_key, max_messages=500):
         if start > 0:
             nl = tail_data.find("\n")
             if nl >= 0:
-                tail_data = tail_data[nl + 1:]
+                tail_data = tail_data[nl + 1 :]
         for line in tail_data.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if entry.get("type") != "message":
-                    continue
-                msg = entry.get("message", {})
-                role = msg.get("role", "")
-                ts = entry.get("timestamp", "")
-                if role == "toolResult":
-                    continue
-                content = msg.get("content", "")
-                text = ""
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    parts = []
-                    tool_calls = []
-                    for item in content:
-                        if isinstance(item, dict):
-                            if item.get("type") == "text":
-                                t = item.get("text", "").strip()
-                                if t:
-                                    parts.append(t)
-                            elif item.get("type") == "toolCall":
-                                name = item.get("name", "")
-                                args = item.get("arguments", {})
-                                if name == "exec":
-                                    cmd = args.get("command", "")
-                                    if "office.py" in cmd:
-                                        tool_calls.append(f"\u2699\ufe0f {cmd.split('office.py')[1].strip()[:80]}")
-                                    elif "openclaw agent" in cmd:
-                                        m_agent = re.search(r'--agent\s+(\S+)', cmd)
-                                        m_msg = re.search(r'--message\s+"([^"]*)"', cmd)
-                                        aname = m_agent.group(1) if m_agent else "?"
-                                        mtxt = m_msg.group(1)[:60] if m_msg else ""
-                                        tool_calls.append(f"\ud83d\udce1 \u2192 {aname}: {mtxt}")
-                                    else:
-                                        tool_calls.append(f"\u2699\ufe0f {cmd[:60]}")
-                                elif name == "process":
-                                    tool_calls.append("\u23f3 polling...")
-                                elif name == "read":
-                                    tool_calls.append("\ud83d\udcc4 reading file")
-                                elif name == "sessions_send":
-                                    smsg = args.get("message", "")[:60]
-                                    slabel = args.get("label", args.get("sessionKey", ""))
-                                    tool_calls.append(f"\ud83d\udce8 \u2192 {slabel}: {smsg}")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") != "message":
+                continue
+            msg = entry.get("message", {})
+            role = msg.get("role", "")
+            ts = entry.get("timestamp", "")
+            if role == "toolResult":
+                continue
+            content = msg.get("content", "")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = []
+                tool_calls = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            t = item.get("text", "").strip()
+                            if t:
+                                parts.append(t)
+                        elif item.get("type") == "toolCall":
+                            name = item.get("name", "")
+                            args = item.get("arguments", {})
+                            if name == "exec":
+                                cmd = args.get("command", "")
+                                if "office.py" in cmd:
+                                    tool_calls.append(
+                                        f"\u2699\ufe0f {cmd.split('office.py')[1].strip()[:80]}"
+                                    )
+                                elif "openclaw agent" in cmd:
+                                    m_agent = re.search(r"--agent\s+(\S+)", cmd)
+                                    m_msg = re.search(r'--message\s+"([^"]*)"', cmd)
+                                    aname = m_agent.group(1) if m_agent else "?"
+                                    mtxt = m_msg.group(1)[:60] if m_msg else ""
+                                    tool_calls.append(
+                                        f"\ud83d\udce1 \u2192 {aname}: {mtxt}"
+                                    )
                                 else:
-                                    tool_calls.append(f"\ud83d\udd27 {name}")
-                    text = "\n".join(parts)
-                    if tool_calls:
-                        tc_text = "\n".join(tool_calls)
-                        text = f"{text}\n{tc_text}" if text else tc_text
-                if not text:
-                    continue
-                from_agent = ""
-                prov = msg.get("provenance", {})
-                if role == "user" and prov:
-                    source = prov.get("sourceSessionKey", "")
-                    # Match source session key to any discovered agent
-                    for _da in get_roster():
-                        if _da["id"] in source or _da["statusKey"] in source:
-                            from_agent = _da["name"].lower()
-                            break
-                # Send raw epoch ms to client — browser converts to local timezone
-                epoch_ms = 0
-                if ts:
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        epoch_ms = int(dt.timestamp() * 1000)
-                    except Exception:
-                        pass
-                messages.append({"role": role, "text": text[:500], "ts": ts, "epochMs": epoch_ms, "from": from_agent})
+                                    tool_calls.append(f"\u2699\ufe0f {cmd[:60]}")
+                            elif name == "process":
+                                tool_calls.append("\u23f3 polling...")
+                            elif name == "read":
+                                tool_calls.append("\ud83d\udcc4 reading file")
+                            elif name == "sessions_send":
+                                smsg = args.get("message", "")[:60]
+                                slabel = args.get("label", args.get("sessionKey", ""))
+                                tool_calls.append(
+                                    f"\ud83d\udce8 \u2192 {slabel}: {smsg}"
+                                )
+                            else:
+                                tool_calls.append(f"\ud83d\udd27 {name}")
+                text = "\n".join(parts)
+                if tool_calls:
+                    tc_text = "\n".join(tool_calls)
+                    text = f"{text}\n{tc_text}" if text else tc_text
+            if not text:
+                continue
+            from_agent = ""
+            prov = msg.get("provenance", {})
+            if role == "user" and prov:
+                source = prov.get("sourceSessionKey", "")
+                # Match source session key to any discovered agent
+                for _da in get_roster():
+                    if _da["id"] in source or _da["statusKey"] in source:
+                        from_agent = _da["name"].lower()
+                        break
+            # Send raw epoch ms to client — browser converts to local timezone
+            epoch_ms = 0
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    epoch_ms = int(dt.timestamp() * 1000)
+                except Exception:
+                    pass
+            messages.append(
+                {
+                    "role": role,
+                    "text": text[:500],
+                    "ts": ts,
+                    "epochMs": epoch_ms,
+                    "from": from_agent,
+                }
+            )
     except Exception as e:
         return []
     return messages[-max_messages:]
 
+
 GATEWAY_URL = VO_CONFIG["openclaw"]["gatewayUrl"]
-GATEWAY_URL_FALLBACK = GATEWAY_URL.replace("127.0.0.1", "localhost") if "127.0.0.1" in GATEWAY_URL else GATEWAY_URL
+GATEWAY_URL_FALLBACK = (
+    GATEWAY_URL.replace("127.0.0.1", "localhost")
+    if "127.0.0.1" in GATEWAY_URL
+    else GATEWAY_URL
+)
+
 
 # Extract gateway port for local Host header override.
 # When connecting via Docker bridge (host.docker.internal), websockets sets
@@ -3819,9 +4774,11 @@ GATEWAY_URL_FALLBACK = GATEWAY_URL.replace("127.0.0.1", "localhost") if "127.0.0
 # the gateway correctly recognizes the connection as local and skips the check.
 def _compute_local_host_header(gw_url):
     from urllib.parse import urlparse
+
     parsed = urlparse(gw_url)
     port = parsed.port or 18789
     return f"127.0.0.1:{port}"
+
 
 _GW_LOCAL_HOST = _compute_local_host_header(GATEWAY_URL)
 
@@ -3882,10 +4839,22 @@ def _auto_configure_gateway_origin():
 
         # Signal gateway to reload config
         try:
-            r = subprocess.run(["systemctl", "--user", "kill", "-s", "USR1", "openclaw-gateway.service"],
-                               capture_output=True, timeout=5)
+            r = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "-s",
+                    "USR1",
+                    "openclaw-gateway.service",
+                ],
+                capture_output=True,
+                timeout=5,
+            )
             if r.returncode == 0:
-                print(f"✅ Gateway auto-config: added origin {origin}, gateway reloaded")
+                print(
+                    f"✅ Gateway auto-config: added origin {origin}, gateway reloaded"
+                )
                 return
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -3900,16 +4869,22 @@ def _auto_configure_gateway_origin():
                         cmdline = f.read()
                     if "openclaw" in cmdline and "gateway" in cmdline:
                         os.kill(int(entry), signal.SIGUSR1)
-                        print(f"✅ Gateway auto-config: added origin {origin}, signaled PID {entry}")
+                        print(
+                            f"✅ Gateway auto-config: added origin {origin}, signaled PID {entry}"
+                        )
                         return
                 except (PermissionError, FileNotFoundError, ProcessLookupError):
                     continue
         except FileNotFoundError:
             pass  # not on Linux
 
-        print(f"✅ Gateway auto-config: added origin {origin} (gateway will pick up on next restart)")
+        print(
+            f"✅ Gateway auto-config: added origin {origin} (gateway will pick up on next restart)"
+        )
     except Exception as e:
         print(f"⚠️  Gateway auto-config failed: {e}")
+
+
 GATEWAY_HTTP = VO_CONFIG["openclaw"]["gatewayHttp"]
 CONFIG_PATH = os.path.join(WORKSPACE_BASE, "openclaw.json")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3921,11 +4896,17 @@ def _reload_gateway_globals():
     global GATEWAY_URL, GATEWAY_URL_FALLBACK, _GW_LOCAL_HOST, GATEWAY_HTTP
     global CONFIG_PATH, AUTH_PROFILES_PATH
     GATEWAY_URL = VO_CONFIG["openclaw"]["gatewayUrl"]
-    GATEWAY_URL_FALLBACK = GATEWAY_URL.replace("127.0.0.1", "localhost") if "127.0.0.1" in GATEWAY_URL else GATEWAY_URL
+    GATEWAY_URL_FALLBACK = (
+        GATEWAY_URL.replace("127.0.0.1", "localhost")
+        if "127.0.0.1" in GATEWAY_URL
+        else GATEWAY_URL
+    )
     _GW_LOCAL_HOST = _compute_local_host_header(GATEWAY_URL)
     GATEWAY_HTTP = VO_CONFIG["openclaw"]["gatewayHttp"]
     CONFIG_PATH = os.path.join(WORKSPACE_BASE, "openclaw.json")
-    AUTH_PROFILES_PATH = os.path.join(WORKSPACE_BASE, "agents/main/agent/auth-profiles.json")
+    AUTH_PROFILES_PATH = os.path.join(
+        WORKSPACE_BASE, "agents/main/agent/auth-profiles.json"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3967,7 +4948,9 @@ class ApiUsageCollector:
 
     def start(self):
         """Start the background collection thread."""
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="api-usage-collector")
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="api-usage-collector"
+        )
         self._thread.start()
 
     def get_data(self):
@@ -3984,7 +4967,12 @@ class ApiUsageCollector:
                     self._data = data
             except Exception as e:
                 with self._lock:
-                    self._data = {"providers": [], "timestamp": time.time(), "error": str(e), "source": "error"}
+                    self._data = {
+                        "providers": [],
+                        "timestamp": time.time(),
+                        "error": str(e),
+                        "source": "error",
+                    }
             time.sleep(self.INTERVAL)
 
     def _read_profiles(self):
@@ -4026,7 +5014,9 @@ class ApiUsageCollector:
                 # API key provider — no usage endpoint, just list it
                 result = {
                     "provider": prov,
-                    "displayName": _PROVIDER_LABELS.get(prov, prov.replace("-", " ").title()),
+                    "displayName": _PROVIDER_LABELS.get(
+                        prov, prov.replace("-", " ").title()
+                    ),
                     "type": "api_key",
                     "usage": None,
                 }
@@ -4057,13 +5047,16 @@ class ApiUsageCollector:
     # --- Anthropic (Claude) ---
     def _fetch_claude(self, token, now):
         """Fetch Claude usage from Anthropic OAuth endpoint."""
-        status, data = self._http_get("https://api.anthropic.com/api/oauth/usage", {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "openclaw",
-            "Accept": "application/json",
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20",
-        })
+        status, data = self._http_get(
+            "https://api.anthropic.com/api/oauth/usage",
+            {
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "openclaw",
+                "Accept": "application/json",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
         entry = {
             "provider": "anthropic",
             "displayName": _PROVIDER_LABELS.get("anthropic", "Claude"),
@@ -4071,32 +5064,52 @@ class ApiUsageCollector:
         if status != 200 or not data:
             msg = ""
             if data and isinstance(data, dict):
-                msg = data.get("error", {}).get("message", "") if isinstance(data.get("error"), dict) else str(data.get("error", ""))
+                msg = (
+                    data.get("error", {}).get("message", "")
+                    if isinstance(data.get("error"), dict)
+                    else str(data.get("error", ""))
+                )
             entry["error"] = f"HTTP {status}: {msg}" if msg else f"HTTP {status}"
             return entry
 
         # Parse usage windows
         windows = []
-        if isinstance(data.get("five_hour"), dict) and data["five_hour"].get("utilization") is not None:
-            windows.append({
-                "label": "5h",
-                "usedPercent": min(100, max(0, data["five_hour"]["utilization"])),
-                "resetAt": int(self._parse_ts(data["five_hour"].get("resets_at"))) if data["five_hour"].get("resets_at") else 0,
-            })
-        if isinstance(data.get("seven_day"), dict) and data["seven_day"].get("utilization") is not None:
-            windows.append({
-                "label": "Week",
-                "usedPercent": min(100, max(0, data["seven_day"]["utilization"])),
-                "resetAt": int(self._parse_ts(data["seven_day"].get("resets_at"))) if data["seven_day"].get("resets_at") else 0,
-            })
+        if (
+            isinstance(data.get("five_hour"), dict)
+            and data["five_hour"].get("utilization") is not None
+        ):
+            windows.append(
+                {
+                    "label": "5h",
+                    "usedPercent": min(100, max(0, data["five_hour"]["utilization"])),
+                    "resetAt": int(self._parse_ts(data["five_hour"].get("resets_at")))
+                    if data["five_hour"].get("resets_at")
+                    else 0,
+                }
+            )
+        if (
+            isinstance(data.get("seven_day"), dict)
+            and data["seven_day"].get("utilization") is not None
+        ):
+            windows.append(
+                {
+                    "label": "Week",
+                    "usedPercent": min(100, max(0, data["seven_day"]["utilization"])),
+                    "resetAt": int(self._parse_ts(data["seven_day"].get("resets_at")))
+                    if data["seven_day"].get("resets_at")
+                    else 0,
+                }
+            )
         # Model-specific windows (sonnet/opus)
         for key, label in [("seven_day_sonnet", "Sonnet"), ("seven_day_opus", "Opus")]:
             mw = data.get(key)
             if isinstance(mw, dict) and mw.get("utilization") is not None:
-                windows.append({
-                    "label": label,
-                    "usedPercent": min(100, max(0, mw["utilization"])),
-                })
+                windows.append(
+                    {
+                        "label": label,
+                        "usedPercent": min(100, max(0, mw["utilization"])),
+                    }
+                )
 
         if windows:
             entry["usage"] = self._windows_to_usage(windows, now)
@@ -4114,7 +5127,9 @@ class ApiUsageCollector:
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
 
-        status, data = self._http_get("https://chatgpt.com/backend-api/wham/usage", headers)
+        status, data = self._http_get(
+            "https://chatgpt.com/backend-api/wham/usage", headers
+        )
         entry = {
             "provider": "openai-codex",
             "displayName": _PROVIDER_LABELS.get("openai-codex", "Codex"),
@@ -4130,11 +5145,13 @@ class ApiUsageCollector:
         pw = rl.get("primary_window")
         if pw:
             hours = round((pw.get("limit_window_seconds", 10800)) / 3600)
-            windows.append({
-                "label": f"{hours}h",
-                "usedPercent": min(100, max(0, pw.get("used_percent", 0))),
-                "resetAt": int(pw["reset_at"] * 1000) if pw.get("reset_at") else 0,
-            })
+            windows.append(
+                {
+                    "label": f"{hours}h",
+                    "usedPercent": min(100, max(0, pw.get("used_percent", 0))),
+                    "resetAt": int(pw["reset_at"] * 1000) if pw.get("reset_at") else 0,
+                }
+            )
 
         # Secondary window (usually week)
         sw = rl.get("secondary_window")
@@ -4146,11 +5163,13 @@ class ApiUsageCollector:
             if pw and sw.get("reset_at") and pw.get("reset_at"):
                 if sw["reset_at"] - pw["reset_at"] >= 4320 * 60:
                     label = "Week"
-            windows.append({
-                "label": label,
-                "usedPercent": min(100, max(0, sw.get("used_percent", 0))),
-                "resetAt": int(sw["reset_at"] * 1000) if sw.get("reset_at") else 0,
-            })
+            windows.append(
+                {
+                    "label": label,
+                    "usedPercent": min(100, max(0, sw.get("used_percent", 0))),
+                    "resetAt": int(sw["reset_at"] * 1000) if sw.get("reset_at") else 0,
+                }
+            )
 
         # Plan info
         plan = data.get("plan_type")
@@ -4168,11 +5187,14 @@ class ApiUsageCollector:
     # --- GitHub Copilot ---
     def _fetch_copilot(self, token, now):
         """Fetch GitHub Copilot usage."""
-        status, data = self._http_get("https://api.github.com/copilot_internal/v2/token", {
-            "Authorization": f"token {token}",
-            "Accept": "application/json",
-            "User-Agent": "openclaw",
-        })
+        status, data = self._http_get(
+            "https://api.github.com/copilot_internal/v2/token",
+            {
+                "Authorization": f"token {token}",
+                "Accept": "application/json",
+                "User-Agent": "openclaw",
+            },
+        )
         entry = {
             "provider": "github-copilot",
             "displayName": _PROVIDER_LABELS.get("github-copilot", "Copilot"),
@@ -4192,7 +5214,9 @@ class ApiUsageCollector:
             used = w.get("usedPercent", 0)
             left = 100 - used
             reset_at = w.get("resetAt", 0)
-            time_left = ApiUsageCollector._format_time_left(reset_at, now) if reset_at else ""
+            time_left = (
+                ApiUsageCollector._format_time_left(reset_at, now) if reset_at else ""
+            )
 
             if label in ("5h", "day", "daily", "24h", "3h"):
                 usage["dailyPctLeft"] = left
@@ -4295,7 +5319,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             hermes = _load_hermes_agents()
             _oc_overrides = {}
             _oc_branches = {}
-            _hermes_branches = {b["id"]: b for b in hermes.get("branches", []) if b.get("id")}
+            _hermes_branches = {
+                b["id"]: b for b in hermes.get("branches", []) if b.get("id")
+            }
             try:
                 _oc_path = os.path.join(STATUS_DIR, "office-config.json")
                 with open(_oc_path, "r") as f:
@@ -4322,7 +5348,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 branch_name = _oc_branches.get(branch_id, "") if branch_id else ""
                 if not branch_name:
                     branch_name = "Unassigned"
-                agents.append({
+                entry = {
                     "key": agent_key,
                     "agentId": a.get("id", ""),
                     "sessionKey": session_key,
@@ -4332,7 +5358,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     "model": a.get("model", ""),
                     "lastActiveAt": a.get("lastActiveAt", 0),
                     "branch": branch_name,
-                })
+                }
+                if a.get("actions"):
+                    entry["actions"] = _enrich_actions_with_runtime_state(
+                        agent_key, a.get("actions")
+                    )
+                agents.append(entry)
             # Enforce agent limit in demo mode
             agent_limit = get_agent_limit()
             if agent_limit > 0 and len(agents) > agent_limit:
@@ -4344,7 +5375,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"wsPort": WS_PORT, "token": _get_gateway_token()}).encode())
+            self.wfile.write(
+                json.dumps({"wsPort": WS_PORT, "token": _get_gateway_token()}).encode()
+            )
         elif self.path == "/agent-chat":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4402,7 +5435,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         if pid not in wf_entries:
                             wf_entries[pid] = pwf
                         else:
-                            for k in ("currentAssignee", "currentTaskTitle", "currentTaskId"):
+                            for k in (
+                                "currentAssignee",
+                                "currentTaskTitle",
+                                "currentTaskId",
+                            ):
                                 if not wf_entries[pid].get(k) and pwf.get(k):
                                     wf_entries[pid][k] = pwf[k]
             except Exception:
@@ -4418,9 +5455,14 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 if not agent_id and task_id:
                     if not proj_data:
                         proj_data = _load_projects()
-                    p = next((x for x in proj_data.get("projects", []) if x["id"] == pid), None)
+                    p = next(
+                        (x for x in proj_data.get("projects", []) if x["id"] == pid),
+                        None,
+                    )
                     if p:
-                        task = next((t for t in p.get("tasks", []) if t["id"] == task_id), None)
+                        task = next(
+                            (t for t in p.get("tasks", []) if t["id"] == task_id), None
+                        )
                         if task:
                             agent_id = task.get("assignee")
                             if not task_title:
@@ -4466,7 +5508,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         if c["id"] == task.get("columnId"):
                             col_title = c.get("title", "")
                             break
-                    phase = "in_progress" if col_title.lower() == "in progress" else "reviewing"
+                    phase = (
+                        "in_progress"
+                        if col_title.lower() == "in progress"
+                        else "reviewing"
+                    )
                     for sk, aid in AGENT_SESSION_IDS.items():
                         if aid == assignee and sk not in project_work:
                             project_work[sk] = {
@@ -4490,7 +5536,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                             "phase": info.get("phase", ""),
                             "updatedAt": now_ms,
                         }
-                    shared_path = os.path.join(WORKSPACE_BASE, "shared", "project-work.json")
+                    shared_path = os.path.join(
+                        WORKSPACE_BASE, "shared", "project-work.json"
+                    )
                     os.makedirs(os.path.dirname(shared_path), exist_ok=True)
                     with open(shared_path, "w") as _spf:
                         json.dump(shared, _spf)
@@ -4505,7 +5553,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             try:
-                with open(os.path.join(STATUS_DIR, "browser-controller.json"), "r") as f:
+                with open(
+                    os.path.join(STATUS_DIR, "browser-controller.json"), "r"
+                ) as f:
                     data = json.loads(f.read())
                 # Stale if older than 120 seconds
                 if time.time() - data.get("ts", 0) > 120:
@@ -4519,7 +5569,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            enabled = VO_CONFIG.get("features", {}).get("browserPanel", False) and check_feature("browserPanel")
+            enabled = VO_CONFIG.get("features", {}).get(
+                "browserPanel", False
+            ) and check_feature("browserPanel")
             cdp_url = VO_CONFIG.get("browser", {}).get("cdpUrl")
             viewer_url = VO_CONFIG.get("browser", {}).get("viewerUrl")
             cdp_available = False
@@ -4529,12 +5581,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     cdp_available = True
                 except Exception:
                     pass
-            self.wfile.write(json.dumps({
-                "enabled": enabled,
-                "cdpAvailable": cdp_available,
-                "viewerUrl": viewer_url,
-                "cdpUrl": cdp_url
-            }).encode())
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "enabled": enabled,
+                        "cdpAvailable": cdp_available,
+                        "viewerUrl": viewer_url,
+                        "cdpUrl": cdp_url,
+                    }
+                ).encode()
+            )
         elif self.path == "/browser-tabs":
             # Proxy CDP tab list for browser URL bar
             self.send_response(200)
@@ -4546,11 +5602,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"available": False}).encode())
             else:
                 try:
-                    req = urllib.request.urlopen(cdp_url.rstrip("/") + "/json", timeout=2)
+                    req = urllib.request.urlopen(
+                        cdp_url.rstrip("/") + "/json", timeout=2
+                    )
                     tabs = json.loads(req.read().decode())
                     self.wfile.write(json.dumps(tabs).encode())
                 except Exception as e:
-                    self.wfile.write(json.dumps({"available": False, "error": str(e)}).encode())
+                    self.wfile.write(
+                        json.dumps({"available": False, "error": str(e)}).encode()
+                    )
         elif self.path == "/session-info" or self.path.startswith("/session-info?"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4622,12 +5682,22 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             sms_cfg = VO_CONFIG.get("sms", {})
-            enabled = VO_CONFIG.get("features", {}).get("smsPanel", False) and check_feature("smsPanel")
-            self.wfile.write(json.dumps({
-                "enabled": enabled,
-                "agentId": sms_cfg.get("agentId"),
-                "hasCredentials": bool(sms_cfg.get("twilioAccountSid") and sms_cfg.get("twilioAuthToken") and sms_cfg.get("fromNumber")),
-            }).encode())
+            enabled = VO_CONFIG.get("features", {}).get(
+                "smsPanel", False
+            ) and check_feature("smsPanel")
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "enabled": enabled,
+                        "agentId": sms_cfg.get("agentId"),
+                        "hasCredentials": bool(
+                            sms_cfg.get("twilioAccountSid")
+                            and sms_cfg.get("twilioAuthToken")
+                            and sms_cfg.get("fromNumber")
+                        ),
+                    }
+                ).encode()
+            )
         elif self.path == "/sms-log":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -4663,7 +5733,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             roster = []
             for a in hermes.get("agents", []):
-                roster.append({
+                entry = {
                     "id": a.get("id", ""),
                     "statusKey": a.get("statusKey") or a.get("id", ""),
                     "name": a.get("name", a.get("id", "")),
@@ -4671,12 +5741,76 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     "role": a.get("role", ""),
                     "model": a.get("model", ""),
                     "lastActiveAt": a.get("lastActiveAt", 0),
-                })
+                }
+                if a.get("actions"):
+                    entry["actions"] = _enrich_actions_with_runtime_state(
+                        agent_key, a.get("actions")
+                    )
+                roster.append(entry)
             # Enforce agent limit in demo mode
             agent_limit = get_agent_limit()
             if agent_limit > 0 and len(roster) > agent_limit:
                 roster = roster[:agent_limit]
             self.wfile.write(json.dumps({"agents": roster}).encode())
+        elif self.path.startswith("/api/agent/action-log"):
+            # GET /api/agent/action-log?agent=<key>&action_id=<id>
+            from urllib.parse import urlparse, parse_qs
+
+            qs = parse_qs(urlparse(self.path).query)
+            agent_key = qs.get("agent", [""])[0]
+            action_id = qs.get("action_id", [""])[0]
+            if not agent_key or not action_id:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": "agent and action_id are required"}
+                    ).encode()
+                )
+                return
+            log_dir = os.path.join(STATUS_DIR, "action-logs")
+            pattern = os.path.join(log_dir, f"{agent_key}_{action_id}_*.log")
+            import glob as _glob
+
+            matches = sorted(_glob.glob(pattern))
+            if not matches:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"No log found for {agent_key}/{action_id}",
+                        }
+                    ).encode()
+                )
+                return
+            latest = matches[-1]
+            try:
+                with open(latest, "r") as f:
+                    lines = f.readlines()
+                tail = "".join(lines[-50:])
+            except Exception as e:
+                tail = f"(error reading log: {e})"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "agent": agent_key,
+                        "action_id": action_id,
+                        "log_path": latest,
+                        "content": tail,
+                    }
+                ).encode()
+            )
         elif self.path.startswith("/api/agent/") and "/skills" in self.path:
             # GET /api/agent/<id>/skills — list skills for an agent
             parts = self.path.split("/api/agent/")[1].split("/skills")
@@ -4729,33 +5863,63 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 except Exception:
                     parsed = {}
                 meaningful = bool(
-                    (isinstance(parsed, dict) and (
-                        parsed.get("canvasWidth") or parsed.get("canvasHeight") or
-                        (isinstance(parsed.get("furniture"), list) and len(parsed.get("furniture")) > 0) or
-                        (isinstance(parsed.get("branches"), list) and len(parsed.get("branches")) > 0) or
-                        parsed.get("floor") or parsed.get("agents") or
-                        (isinstance(parsed.get("walls"), dict) and (
-                            (isinstance(parsed.get("walls", {}).get("interior"), list) and len(parsed.get("walls", {}).get("interior")) > 0) or
-                            (isinstance(parsed.get("walls", {}).get("sections"), list) and len(parsed.get("walls", {}).get("sections")) > 0)
-                        ))
-                    ))
+                    (
+                        isinstance(parsed, dict)
+                        and (
+                            parsed.get("canvasWidth")
+                            or parsed.get("canvasHeight")
+                            or (
+                                isinstance(parsed.get("furniture"), list)
+                                and len(parsed.get("furniture")) > 0
+                            )
+                            or (
+                                isinstance(parsed.get("branches"), list)
+                                and len(parsed.get("branches")) > 0
+                            )
+                            or parsed.get("floor")
+                            or parsed.get("agents")
+                            or (
+                                isinstance(parsed.get("walls"), dict)
+                                and (
+                                    (
+                                        isinstance(
+                                            parsed.get("walls", {}).get("interior"),
+                                            list,
+                                        )
+                                        and len(parsed.get("walls", {}).get("interior"))
+                                        > 0
+                                    )
+                                    or (
+                                        isinstance(
+                                            parsed.get("walls", {}).get("sections"),
+                                            list,
+                                        )
+                                        and len(parsed.get("walls", {}).get("sections"))
+                                        > 0
+                                    )
+                                )
+                            )
+                        )
+                    )
                 )
                 if not meaningful:
                     # No saved config — serve bundled default with live agent roster
-                    _default_oc2 = os.path.join(os.path.dirname(__file__) or '.', 'default-office-config.json')
+                    _default_oc2 = os.path.join(
+                        os.path.dirname(__file__) or ".", "default-office-config.json"
+                    )
                     try:
-                        with open(_default_oc2, 'r') as df:
+                        with open(_default_oc2, "r") as df:
                             ddata = df.read()
                         ddata = _patch_default_config_agents(ddata)
                         self.send_response(200)
-                        self.send_header('Content-Type', 'application/json')
-                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
                         self.end_headers()
                         self.wfile.write(ddata.encode())
                     except FileNotFoundError:
                         self.send_response(404)
-                        self.send_header('Content-Type', 'application/json')
-                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
                         self.end_headers()
                         self.wfile.write(b'{"error":"No saved config"}')
                     return
@@ -4766,20 +5930,22 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(data.encode())
             except FileNotFoundError:
                 # Try bundled default config with live agent roster
-                _default_oc = os.path.join(os.path.dirname(__file__) or '.', 'default-office-config.json')
+                _default_oc = os.path.join(
+                    os.path.dirname(__file__) or ".", "default-office-config.json"
+                )
                 try:
-                    with open(_default_oc, 'r') as f:
+                    with open(_default_oc, "r") as f:
                         data = f.read()
                     data = _patch_default_config_agents(data)
                     self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.wfile.write(data.encode())
                 except FileNotFoundError:
                     self.send_response(404)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.wfile.write(b'{"error":"No saved config"}')
         elif self.path == "/api/license":
@@ -4832,11 +5998,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             if not _wloc:
                 self.send_response(404)
                 self.end_headers()
-                self.wfile.write(b'{"error":"Weather location not configured. Set weather.location in vo-config.json"}')
+                self.wfile.write(
+                    b'{"error":"Weather location not configured. Set weather.location in vo-config.json"}'
+                )
                 return
             try:
-                _wloc_encoded = urllib.parse.quote(_wloc, safe='')
-                req = urllib.request.Request(f"https://wttr.in/{_wloc_encoded}?format=j1", headers={"User-Agent": "curl/7.68"})
+                _wloc_encoded = urllib.parse.quote(_wloc, safe="")
+                req = urllib.request.Request(
+                    f"https://wttr.in/{_wloc_encoded}?format=j1",
+                    headers={"User-Agent": "curl/7.68"},
+                )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = resp.read()
                 self.send_response(200)
@@ -4855,7 +6026,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/skills-library/") and self.path != "/api/skills-library/apply" and self.path != "/api/skills-library/upload":
+        elif (
+            self.path.startswith("/api/skills-library/")
+            and self.path != "/api/skills-library/apply"
+            and self.path != "/api/skills-library/upload"
+        ):
             skill_name = self.path.split("/api/skills-library/")[1].strip("/")
             result = _handle_skills_library_get(skill_name)
             self.send_response(result.get("_status", 200))
@@ -4887,16 +6062,24 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and self.path.endswith("/workflow/chat"):
-            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/chat", 1)[0]
+        elif self.path.startswith("/api/projects/") and self.path.endswith(
+            "/workflow/chat"
+        ):
+            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/chat", 1)[
+                0
+            ]
             result = _handle_workflow_chat(proj_id)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and self.path.endswith("/workflow/status"):
-            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/status", 1)[0]
+        elif self.path.startswith("/api/projects/") and self.path.endswith(
+            "/workflow/status"
+        ):
+            proj_id = self.path.split("/api/projects/")[1].rsplit(
+                "/workflow/status", 1
+            )[0]
             result = _handle_workflow_status(proj_id)
             self.send_response(result.get("_status", 200))
             self.send_header("Content-Type", "application/json")
@@ -4913,7 +6096,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and "/tasks" not in self.path and "/report" not in self.path and "/workflow" not in self.path:
+        elif (
+            self.path.startswith("/api/projects/")
+            and "/tasks" not in self.path
+            and "/report" not in self.path
+            and "/workflow" not in self.path
+        ):
             proj_id = self.path.split("/api/projects/")[1].strip("/")
             if proj_id and proj_id != "templates":
                 result = _handle_project_get(proj_id)
@@ -4942,8 +6130,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         if not ws_dir:
             hermes = _load_hermes_agents()
             hermes_keys = {
-                a.get("statusKey") or a.get("id", "")
-                for a in hermes.get("agents", [])
+                a.get("statusKey") or a.get("id", "") for a in hermes.get("agents", [])
             }
             if agent_key in hermes_keys:
                 ws_dir = get_agent_workspace_dir(WORKSPACE_BASE, agent_key).replace(
@@ -4955,7 +6142,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         ws_path = os.path.join(WORKSPACE_BASE, ws_dir)
         result = {}
 
-        for fname in ["AGENTS.md", "SOUL.md", "MEMORY.md", "TOOLS.md", "IDENTITY.md", "USER.md", "HEARTBEAT.md"]:
+        for fname in [
+            "AGENTS.md",
+            "SOUL.md",
+            "MEMORY.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "USER.md",
+            "HEARTBEAT.md",
+        ]:
             fpath = os.path.join(ws_path, fname)
             try:
                 with open(fpath, "r") as f:
@@ -4970,7 +6165,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         result["daily"] = ""
         result["dailyFile"] = ""
         if os.path.isdir(mem_dir):
-            md_files = sorted([f for f in os.listdir(mem_dir) if f.endswith(".md")], reverse=True)
+            md_files = sorted(
+                [f for f in os.listdir(mem_dir) if f.endswith(".md")], reverse=True
+            )
             if md_files:
                 latest = md_files[0]
                 result["dailyFile"] = latest
@@ -4997,16 +6194,20 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         models = []
         try:
             if provider == "openai":
-                req = urllib.request.Request("https://api.openai.com/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"})
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read())
                 for m in data.get("data", []):
                     models.append(m.get("id", ""))
 
             elif provider == "anthropic":
-                req = urllib.request.Request("https://api.anthropic.com/v1/models",
-                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"})
+                req = urllib.request.Request(
+                    "https://api.anthropic.com/v1/models",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+                )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read())
                 for m in data.get("data", []):
@@ -5023,8 +6224,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     models.append(m.get("name", "").replace("models/", ""))
 
             elif provider == "groq":
-                req = urllib.request.Request("https://api.groq.com/openai/v1/models",
-                    headers={"Authorization": f"Bearer {api_key}"})
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read())
                 for m in data.get("data", []):
@@ -5071,8 +6274,18 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 if not openclaw_bin:
                     continue
                 result = subprocess.run(
-                    [openclaw_bin, "models", "list", "--provider", provider, "--all", "--json"],
-                    capture_output=True, text=True, timeout=30
+                    [
+                        openclaw_bin,
+                        "models",
+                        "list",
+                        "--provider",
+                        provider,
+                        "--all",
+                        "--json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
                 if result.returncode != 0:
                     continue
@@ -5087,7 +6300,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
                 # Update the config to reflect only discovered models
                 cls._sync_config_models(provider, discovered)
-                cls._oauth_model_cache[provider] = {"models": discovered, "ts": time.time()}
+                cls._oauth_model_cache[provider] = {
+                    "models": discovered,
+                    "ts": time.time(),
+                }
             except Exception:
                 pass  # Silently skip — will retry next cache expiry
 
@@ -5109,7 +6325,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             changed = False
 
             # Remove config entries not in discovered set
-            to_remove = [k for k in models_cfg if k.startswith(prefix) and k not in discovered_set]
+            to_remove = [
+                k
+                for k in models_cfg
+                if k.startswith(prefix) and k not in discovered_set
+            ]
             for k in to_remove:
                 del models_cfg[k]
                 changed = True
@@ -5145,11 +6365,13 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         try:
             with open(CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
-            configured_models = cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            configured_models = (
+                cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            )
             prefix = f"{base_provider}/"
             for model_id in configured_models.keys():
                 if model_id.startswith(prefix):
-                    short_id = model_id[len(prefix):]
+                    short_id = model_id[len(prefix) :]
                     models.append(short_id)
             models.sort()
             cache = self.__class__._registry_cache
@@ -5216,7 +6438,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             return {"model": "unknown", "contextWindow": 0, "error": str(e)}
 
         # Get default model (global fallback)
-        default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "unknown")
+        default_model = (
+            cfg.get("agents", {})
+            .get("defaults", {})
+            .get("model", {})
+            .get("primary", "unknown")
+        )
 
         # Check main/default agent override
         for a in cfg.get("agents", {}).get("list", []):
@@ -5284,24 +6511,39 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 key = profile.get("key", "")
                 access = profile.get("access", "")
                 token = profile.get("token", "")
-                is_oauth = profile.get("type") in ("oauth", "token") or bool(access) or bool(token)
-                
+                is_oauth = (
+                    profile.get("type") in ("oauth", "token")
+                    or bool(access)
+                    or bool(token)
+                )
+
                 # For providers with both API key and subscription, create separate entries
                 if key:
                     # API key entry
                     masked = (key[:4] + "••••••••") if len(key) > 4 else ""
                     auth_profiles[base_provider] = {
-                        "hasKey": True, "maskedKey": masked, "profileId": pid, 
-                        "isOAuth": False, "authType": "api_key"
+                        "hasKey": True,
+                        "maskedKey": masked,
+                        "profileId": pid,
+                        "isOAuth": False,
+                        "authType": "api_key",
                     }
                     raw_keys[base_provider] = key
-                
+
                 if is_oauth and (access or token):
                     # Subscription/OAuth entry - use separate provider name
-                    sub_provider = f"{base_provider}-token" if token and not access else f"{base_provider}-oauth"
+                    sub_provider = (
+                        f"{base_provider}-token"
+                        if token and not access
+                        else f"{base_provider}-oauth"
+                    )
                     expires = profile.get("expires", 0)
                     if expires:
-                        remaining = (expires / 1000 - time.time()) if expires > 1e12 else (expires - time.time())
+                        remaining = (
+                            (expires / 1000 - time.time())
+                            if expires > 1e12
+                            else (expires - time.time())
+                        )
                         days = max(0, int(remaining / 86400))
                         masked = f"OAuth (expires {days}d)"
                     elif token:
@@ -5309,8 +6551,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     else:
                         masked = "OAuth"
                     auth_profiles[sub_provider] = {
-                        "hasKey": True, "maskedKey": masked, "profileId": pid,
-                        "isOAuth": True, "authType": "subscription"
+                        "hasKey": True,
+                        "maskedKey": masked,
+                        "profileId": pid,
+                        "isOAuth": True,
+                        "authType": "subscription",
                     }
         except Exception:
             pass
@@ -5323,7 +6568,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         # For OAuth/token providers without API keys, use OpenClaw's model registry
         for provider, info in auth_profiles.items():
-            if info.get("isOAuth") and provider not in raw_keys and "models" not in info:
+            if (
+                info.get("isOAuth")
+                and provider not in raw_keys
+                and "models" not in info
+            ):
                 registry_models = self._fetch_registry_models(provider)
                 info["models"] = registry_models
 
@@ -5333,42 +6582,48 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             custom_providers[prov_name] = {
                 "baseUrl": prov_data.get("baseUrl", ""),
                 "api": prov_data.get("api", ""),
-                "models": [{"id": m["id"], "name": m.get("name", m["id"]),
-                            "contextWindow": m.get("contextWindow", 0),
-                            "maxTokens": m.get("maxTokens", 0)}
-                           for m in prov_data.get("models", [])]
+                "models": [
+                    {
+                        "id": m["id"],
+                        "name": m.get("name", m["id"]),
+                        "contextWindow": m.get("contextWindow", 0),
+                        "maxTokens": m.get("maxTokens", 0),
+                    }
+                    for m in prov_data.get("models", [])
+                ],
             }
 
         # Read model params from agents.defaults.models
         model_params = {}
-        for mid, mdata in cfg.get("agents", {}).get("defaults", {}).get("models", {}).items():
+        for mid, mdata in (
+            cfg.get("agents", {}).get("defaults", {}).get("models", {}).items()
+        ):
             p = mdata.get("params", {})
             if p:
                 model_params[mid] = p
 
         # Configured models from agents.defaults.models
         configured_models = {}
-        for mid, mdata in cfg.get("agents", {}).get("defaults", {}).get("models", {}).items():
+        for mid, mdata in (
+            cfg.get("agents", {}).get("defaults", {}).get("models", {}).items()
+        ):
             configured_models[mid] = mdata
 
-        return {"authProfiles": auth_profiles, "customProviders": custom_providers, "modelParams": model_params, "configuredModels": configured_models}
+        return {
+            "authProfiles": auth_profiles,
+            "customProviders": custom_providers,
+            "modelParams": model_params,
+            "configuredModels": configured_models,
+        }
 
     def _save_provider_key(self, provider, key):
         """Save a cloud provider API key to auth-profiles.json via watcher."""
-        request = {
-            "type": "save-key",
-            "provider": provider,
-            "key": key
-        }
+        request = {"type": "save-key", "provider": provider, "key": key}
         return self._send_watcher_request(request)
 
     def _delete_provider_key(self, provider, profile_id=""):
         """Delete a cloud provider API key."""
-        request = {
-            "type": "delete-key",
-            "provider": provider,
-            "profileId": profile_id
-        }
+        request = {"type": "delete-key", "provider": provider, "profileId": profile_id}
         return self._send_watcher_request(request)
 
     def _save_custom_provider(self, provider, base_url, models, params=None):
@@ -5458,7 +6713,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             ap = {"version": 1, "profiles": {}, "lastGood": {}}
 
         profile_id = f"{provider}:default"
-        ap["profiles"][profile_id] = {"type": "api_key", "provider": provider, "key": key}
+        ap["profiles"][profile_id] = {
+            "type": "api_key",
+            "provider": provider,
+            "key": key,
+        }
         ap["lastGood"][provider] = profile_id
 
         try:
@@ -5470,7 +6729,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         # Mirror in openclaw.json
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
-        cfg.setdefault("auth", {}).setdefault("profiles", {})[profile_id] = {"provider": provider, "mode": "api_key"}
+        cfg.setdefault("auth", {}).setdefault("profiles", {})[profile_id] = {
+            "provider": provider,
+            "mode": "api_key",
+        }
         ok, err = self._write_openclaw_config(cfg)
         if not ok:
             return {"ok": False, "error": err}
@@ -5549,22 +6811,33 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     updated["maxTokens"] = m["maxTokens"]
                 new_models.append(updated)
             else:
-                new_models.append({
-                    "id": m["id"],
-                    "name": m.get("name", m["id"]),
-                    "reasoning": False,
-                    "input": ["text"],
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                    "contextWindow": m.get("contextWindow", 100000),
-                    "maxTokens": m.get("maxTokens", 8192),
-                })
+                new_models.append(
+                    {
+                        "id": m["id"],
+                        "name": m.get("name", m["id"]),
+                        "reasoning": False,
+                        "input": ["text"],
+                        "cost": {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                        },
+                        "contextWindow": m.get("contextWindow", 100000),
+                        "maxTokens": m.get("maxTokens", 8192),
+                    }
+                )
         existing["models"] = new_models
         cfg["models"]["providers"][provider] = existing
 
         # Save inference params
         params = req.get("params", {})
         if params:
-            defaults_models = cfg.setdefault("agents", {}).setdefault("defaults", {}).setdefault("models", {})
+            defaults_models = (
+                cfg.setdefault("agents", {})
+                .setdefault("defaults", {})
+                .setdefault("models", {})
+            )
             for model_id, model_params in params.items():
                 defaults_models.setdefault(model_id, {})["params"] = model_params
 
@@ -5591,11 +6864,24 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         # Method 1: systemctl (works on host or with systemd access)
         try:
             if restart:
-                r = subprocess.run(["systemctl", "--user", "restart", "openclaw-gateway.service"],
-                                   capture_output=True, timeout=10)
+                r = subprocess.run(
+                    ["systemctl", "--user", "restart", "openclaw-gateway.service"],
+                    capture_output=True,
+                    timeout=10,
+                )
             else:
-                r = subprocess.run(["systemctl", "--user", "kill", "-s", "USR1", "openclaw-gateway.service"],
-                                   capture_output=True, timeout=5)
+                r = subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "kill",
+                        "-s",
+                        "USR1",
+                        "openclaw-gateway.service",
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
             if r.returncode == 0:
                 return True
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -5609,8 +6895,12 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 try:
                     with open(f"/proc/{pid_dir}/cmdline", "rb") as f:
                         cmdline = f.read().decode("utf-8", errors="ignore")
-                    if "openclaw" in cmdline and ("gateway" in cmdline or "serve" in cmdline):
-                        os.kill(int(pid_dir), signal.SIGUSR2 if restart else signal.SIGUSR1)
+                    if "openclaw" in cmdline and (
+                        "gateway" in cmdline or "serve" in cmdline
+                    ):
+                        os.kill(
+                            int(pid_dir), signal.SIGUSR2 if restart else signal.SIGUSR1
+                        )
                         return True
                 except (PermissionError, ProcessLookupError, FileNotFoundError):
                     continue
@@ -5619,8 +6909,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         # Method 3: pgrep fallback
         try:
-            result = subprocess.run(["pgrep", "-f", "openclaw"],
-                                    capture_output=True, text=True, timeout=5)
+            result = subprocess.run(
+                ["pgrep", "-f", "openclaw"], capture_output=True, text=True, timeout=5
+            )
             for pid in result.stdout.strip().split("\n"):
                 if pid.strip():
                     os.kill(int(pid.strip()), signal.SIGUSR1)
@@ -5649,9 +6940,22 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         models = []
         # Default model
-        default_model = cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        default_model = (
+            cfg.get("agents", {})
+            .get("defaults", {})
+            .get("model", {})
+            .get("primary", "")
+        )
         if default_model:
-            models.append({"id": default_model, "label": default_model + " (default)", "provider": default_model.split("/")[0] if "/" in default_model else ""})
+            models.append(
+                {
+                    "id": default_model,
+                    "label": default_model + " (default)",
+                    "provider": default_model.split("/")[0]
+                    if "/" in default_model
+                    else "",
+                }
+            )
 
         # Cloud models from providers with API keys (live-fetched, cached 5min)
         try:
@@ -5666,14 +6970,20 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         if m.startswith("(error"):
                             continue
                         full_id = f"{provider}/{m}"
-                        if full_id != default_model and not any(x["id"] == full_id for x in models):
-                            models.append({"id": full_id, "label": full_id, "provider": provider})
+                        if full_id != default_model and not any(
+                            x["id"] == full_id for x in models
+                        ):
+                            models.append(
+                                {"id": full_id, "label": full_id, "provider": provider}
+                            )
         except Exception:
             pass
 
         # Add configured models from agents.defaults.models (includes OAuth providers like openai-codex)
         try:
-            configured_models = cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            configured_models = (
+                cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            )
             for mid, mdata in configured_models.items():
                 if not any(x["id"] == mid for x in models):
                     provider = mid.split("/")[0] if "/" in mid else ""
@@ -5697,12 +7007,14 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     oauth_providers[base_prov] = f"{base_prov}-token"
                 elif profile.get("type") == "oauth" or profile.get("access"):
                     oauth_providers[base_prov] = f"{base_prov}-oauth"
-            
+
             pass  # oauth_providers built
-            
+
             # Add subscription versions of configured models for providers with both API+token
             subscription_models = []
-            configured_models = cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            configured_models = (
+                cfg.get("agents", {}).get("defaults", {}).get("models", {})
+            )
             for model in models:
                 if "/" not in model["id"]:
                     continue
@@ -5712,7 +7024,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                     if model["id"] in configured_models:
                         sub_model = dict(model)
                         sub_model["provider"] = oauth_providers[base_prov]
-                        if not any(x["id"] == sub_model["id"] and x["provider"] == sub_model["provider"] for x in models):
+                        if not any(
+                            x["id"] == sub_model["id"]
+                            and x["provider"] == sub_model["provider"]
+                            for x in models
+                        ):
                             subscription_models.append(sub_model)
             models.extend(subscription_models)
         except Exception as e:
@@ -5721,10 +7037,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         # Ollama models from config
         for prov_name, prov_data in cfg.get("models", {}).get("providers", {}).items():
             for m in prov_data.get("models", []):
-                mid = f'{prov_name}/{m["id"]}'
+                mid = f"{prov_name}/{m['id']}"
                 label = m.get("name", m["id"])
                 if not any(x["id"] == mid for x in models):
-                    models.append({"id": mid, "label": f"{prov_name}/{label}", "provider": prov_name})
+                    models.append(
+                        {
+                            "id": mid,
+                            "label": f"{prov_name}/{label}",
+                            "provider": prov_name,
+                        }
+                    )
 
         # Per-agent current models
         agents = {}
@@ -5735,7 +7057,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         for sk, ws in AGENT_WORKSPACES.items():
             # Find matching agent id
             for a in cfg.get("agents", {}).get("list", []):
-                if a.get("workspace", "").endswith(ws) or a["id"] == sk or a["id"] == AGENT_SESSION_IDS.get(sk, ""):
+                if (
+                    a.get("workspace", "").endswith(ws)
+                    or a["id"] == sk
+                    or a["id"] == AGENT_SESSION_IDS.get(sk, "")
+                ):
                     status_to_agent[sk] = a["id"]
                     break
 
@@ -5758,7 +7084,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 ap2 = json.load(f)
             for pid, profile in ap2.get("profiles", {}).items():
                 base_prov = profile.get("provider", pid.split(":")[0])
-                if profile.get("type") in ("oauth", "token") or profile.get("access") or profile.get("token"):
+                if (
+                    profile.get("type") in ("oauth", "token")
+                    or profile.get("access")
+                    or profile.get("token")
+                ):
                     # Map to display provider name
                     if profile.get("token"):
                         display_prov = f"{base_prov}-token"
@@ -5768,12 +7098,20 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         except Exception:
             pass
         try:
-            for mid, mdata in cfg.get("agents", {}).get("defaults", {}).get("models", {}).items():
+            for mid, mdata in (
+                cfg.get("agents", {}).get("defaults", {}).get("models", {}).items()
+            ):
                 configured_models_map[mid] = True
         except Exception:
             pass
 
-        return {"models": models, "agentModels": agent_models, "defaultModel": default_model, "subProviders": sub_providers, "configuredModels": configured_models_map}
+        return {
+            "models": models,
+            "agentModels": agent_models,
+            "defaultModel": default_model,
+            "subProviders": sub_providers,
+            "configuredModels": configured_models_map,
+        }
 
     def _set_agent_model(self, status_key, model_id):
         """Set an agent's model by writing a request file for the host-side watcher."""
@@ -5789,7 +7127,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         for sk, ws in AGENT_WORKSPACES.items():
             if sk == status_key:
                 for a in cfg.get("agents", {}).get("list", []):
-                    if a.get("workspace", "").endswith(ws) or a["id"] == sk or a["id"] == AGENT_SESSION_IDS.get(sk, ""):
+                    if (
+                        a.get("workspace", "").endswith(ws)
+                        or a["id"] == sk
+                        or a["id"] == AGENT_SESSION_IDS.get(sk, "")
+                    ):
                         agent_id = a["id"]
                         break
                 break
@@ -5799,17 +7141,29 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
         # Validate model_id format
         if model_id and "/" not in model_id:
-            return {"ok": False, "error": f"Invalid model format: {model_id}. Must be provider/model"}
+            return {
+                "ok": False,
+                "error": f"Invalid model format: {model_id}. Must be provider/model",
+            }
 
-        request = {"type": "set-model", "agent_id": agent_id, "model": model_id, "status_key": status_key}
+        request = {
+            "type": "set-model",
+            "agent_id": agent_id,
+            "model": model_id,
+            "status_key": status_key,
+        }
         return self._send_watcher_request(request)
 
     def do_PUT(self):
-        length = int(self.headers.get('Content-Length', 0))
+        length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         # ── PROJECTS PUT ─────────────────────────────────────────────
-        if self.path.startswith("/api/projects/") and self.path.endswith("/workflow/auto-mode"):
-            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/auto-mode", 1)[0]
+        if self.path.startswith("/api/projects/") and self.path.endswith(
+            "/workflow/auto-mode"
+        ):
+            proj_id = self.path.split("/api/projects/")[1].rsplit(
+                "/workflow/auto-mode", 1
+            )[0]
             result = _handle_workflow_auto_mode(proj_id, body)
             self.send_response(result.get("_status", 200))
             self.send_header("Content-Type", "application/json")
@@ -5817,7 +7171,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and "/tasks/" in self.path and self.path.endswith("/review-check"):
+        elif (
+            self.path.startswith("/api/projects/")
+            and "/tasks/" in self.path
+            and self.path.endswith("/review-check")
+        ):
             rest = self.path.split("/api/projects/")[1]
             parts = rest.split("/tasks/")
             proj_id = parts[0]
@@ -5858,7 +7216,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_DELETE(self):
         if self.path == "/api/agent/delete":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_agent_delete(body)
             self.send_response(result.get("_status", 200))
@@ -5939,14 +7297,16 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header(
+            "Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"
+        )
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def do_POST(self):
         # --- SETUP WIZARD ---
         if self.path == "/setup/save":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             cfg_path = _resolve_config_path()
             # Always save to persistent volume if available (survives container recreation)
@@ -5957,7 +7317,10 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 # Merge with existing config — read from resolved path first, fall back to app default
                 existing = {}
-                for try_path in [cfg_path, os.path.join(os.path.dirname(__file__), "vo-config.json")]:
+                for try_path in [
+                    cfg_path,
+                    os.path.join(os.path.dirname(__file__), "vo-config.json"),
+                ]:
                     try:
                         with open(try_path, "r") as f:
                             existing = json.load(f)
@@ -5968,7 +7331,9 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 for key in body:
                     if key.startswith("_"):
                         continue
-                    if isinstance(body[key], dict) and isinstance(existing.get(key), dict):
+                    if isinstance(body[key], dict) and isinstance(
+                        existing.get(key), dict
+                    ):
                         existing[key].update(body[key])
                     else:
                         existing[key] = body[key]
@@ -6006,8 +7371,8 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             return
         # --- OFFICE CONFIG PERSISTENCE ---
         elif self.path == "/api/office-config":
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length) if length else b'{}'
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b"{}"
             # Validate JSON
             try:
                 json.loads(body)
@@ -6029,7 +7394,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             return
         # --- AGENT CREATION API ---
         elif self.path == "/api/agent/create":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_agent_create(body)
             self.send_response(result.get("_status", 200))
@@ -6041,7 +7406,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             return
         # --- MEETINGS API ---
         elif self.path == "/api/meetings/create":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_meeting_create(body)
             self.send_response(result.get("_status", 200))
@@ -6052,7 +7417,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
             return
         elif self.path == "/api/meetings/end":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_meeting_end(body)
             self.send_response(result.get("_status", 200))
@@ -6077,7 +7442,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             parts = self.path.split("/api/agent/")[1].split("/skills")
             agent_key = parts[0]
             skill_path = parts[1].strip("/") if len(parts) > 1 else ""
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_skill_write(agent_key, skill_path, body)
             self.send_response(result.get("_status", 200))
@@ -6090,7 +7455,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         # --- PRESENCE API ---
         elif self.path.startswith("/api/presence/"):
             agent_id = self.path.split("/api/presence/")[1].strip("/")
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             state = body.get("state", "idle")
             task = body.get("task", "")
@@ -6104,16 +7469,23 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            self.wfile.write(json.dumps({"ok": True, "agent": agent_id, "state": state}).encode())
+            self.wfile.write(
+                json.dumps({"ok": True, "agent": agent_id, "state": state}).encode()
+            )
             return
         elif self.path == "/transcribe":
             # Proxy to host whisper server
-            length = int(self.headers.get('Content-Length', 0))
-            audio = self.rfile.read(length) if length else b''
+            length = int(self.headers.get("Content-Length", 0))
+            audio = self.rfile.read(length) if length else b""
             try:
                 _whisper_url = VO_CONFIG["whisper"]["url"].rstrip("/") + "/transcribe"
-                req = urllib.request.Request(_whisper_url, data=audio,
-                    headers={'Content-Type': self.headers.get('Content-Type', 'audio/webm')})
+                req = urllib.request.Request(
+                    _whisper_url,
+                    data=audio,
+                    headers={
+                        "Content-Type": self.headers.get("Content-Type", "audio/webm")
+                    },
+                )
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     result = resp.read()
                 self.send_response(200)
@@ -6131,19 +7503,31 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path.startswith("/agent-bio-save/"):
             # Save agent workspace file
             agent_key = self.path.split("/agent-bio-save/")[1]
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             filename = body.get("filename", "")
             content = body.get("content", "")
             # Security: only allow known filenames
-            allowed = ["AGENTS.md", "SOUL.md", "MEMORY.md", "TOOLS.md", "IDENTITY.md", "USER.md", "HEARTBEAT.md"]
+            allowed = [
+                "AGENTS.md",
+                "SOUL.md",
+                "MEMORY.md",
+                "TOOLS.md",
+                "IDENTITY.md",
+                "USER.md",
+                "HEARTBEAT.md",
+            ]
             ws_dir = AGENT_WORKSPACES.get(agent_key)
             if not ws_dir or filename not in allowed:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": f"Invalid agent or filename: {agent_key}/{filename}"}).encode())
+                self.wfile.write(
+                    json.dumps(
+                        {"error": f"Invalid agent or filename: {agent_key}/{filename}"}
+                    ).encode()
+                )
                 return
             ws_path = os.path.join(WORKSPACE_BASE, ws_dir)
             fpath = os.path.join(ws_path, filename)
@@ -6162,8 +7546,233 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
+        elif self.path == "/api/agent/action":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            agent_key = body.get("agent", "")
+            action_id = body.get("action_id", "")
+            hermes = _load_hermes_agents()
+            agent = None
+            for a in hermes.get("agents", []):
+                if (a.get("statusKey") or a.get("id", "")) == agent_key or a.get(
+                    "id", ""
+                ) == agent_key:
+                    agent = a
+                    break
+            if not agent:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": f"Agent not found: {agent_key}"}
+                    ).encode()
+                )
+                return
+            actions = agent.get("actions", [])
+            action = next((a for a in actions if a.get("id") == action_id), None)
+            if not action:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": f"Action not found: {action_id}"}
+                    ).encode()
+                )
+                return
+            command = action.get("command", "")
+            argv = _split_command(command)
+            if not argv:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": "Empty or invalid command"}
+                    ).encode()
+                )
+                return
+            if not _is_action_command_allowed(argv):
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Command not allowed",
+                            "agent": agent_key,
+                            "action_id": action_id,
+                            "command": command,
+                        }
+                    ).encode()
+                )
+                return
+            _cleanup_running_actions()
+            run_key = (agent_key, action_id)
+            if run_key in _running_actions:
+                info = _running_actions[run_key]
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Action already running",
+                            "agent": agent_key,
+                            "action_id": action_id,
+                            "pid": info["proc"].pid,
+                            "log_path": info["log_path"],
+                        }
+                    ).encode()
+                )
+                return
+            log_dir = os.path.join(STATUS_DIR, "action-logs")
+            os.makedirs(log_dir, exist_ok=True)
+            run_id = f"{agent_key}_{action_id}_{int(time.time())}"
+            log_path = os.path.join(log_dir, f"{run_id}.log")
+            try:
+                log_f = open(log_path, "w")
+                proc = subprocess.Popen(
+                    argv,
+                    shell=False,
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                _running_actions[run_key] = {
+                    "proc": proc,
+                    "log_path": log_path,
+                    "log_f": log_f,
+                    "started_at": int(time.time()),
+                }
+            except Exception as e:
+                log_f.close() if "log_f" in dir() else None
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": f"Failed to launch: {e}"}
+                    ).encode()
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "agent": agent.get("name", agent_key),
+                        "action_id": action_id,
+                        "label": action.get("label", ""),
+                        "command": command,
+                        "pid": proc.pid,
+                        "log_path": log_path,
+                    }
+                ).encode()
+            )
+        elif self.path == "/api/agent/action-cancel":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length else {}
+            agent_key = body.get("agent", "")
+            action_id = body.get("action_id", "")
+            if not agent_key or not action_id:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {"ok": False, "error": "Missing agent or action_id"}
+                    ).encode()
+                )
+                return
+            _cleanup_running_actions()
+            run_key = (agent_key, action_id)
+            if run_key not in _running_actions:
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": "Action not running",
+                            "agent": agent_key,
+                            "action_id": action_id,
+                        }
+                    ).encode()
+                )
+                return
+            info = _running_actions[run_key]
+            pid = info["proc"].pid
+            log_path = info["log_path"]
+            proc = info["proc"]
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            try:
+                info["log_f"].close()
+            except Exception:
+                pass
+            exit_code = proc.poll() if proc.poll() is not None else -1
+            _action_results[run_key] = {
+                "agent": agent_key,
+                "action_id": action_id,
+                "pid": pid,
+                "log_path": log_path,
+                "started_at": info.get("started_at", 0),
+                "finished_at": int(time.time()),
+                "exit_code": exit_code,
+                "status": "cancelled",
+            }
+            del _running_actions[run_key]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "agent": agent_key,
+                        "action_id": action_id,
+                        "pid": pid,
+                        "log_path": log_path,
+                        "cancelled": True,
+                    }
+                ).encode()
+            )
         elif self.path == "/set-model":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             agent_key = body.get("agent", "")
             model_id = body.get("model", "")
@@ -6174,34 +7783,43 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/config/providers/save-key":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
-            result = self._save_provider_key(body.get("provider", ""), body.get("key", ""))
+            result = self._save_provider_key(
+                body.get("provider", ""), body.get("key", "")
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/config/providers/delete-key":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
-            result = self._delete_provider_key(body.get("provider", ""), body.get("profileId", ""))
+            result = self._delete_provider_key(
+                body.get("provider", ""), body.get("profileId", "")
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/config/providers/save-custom":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
-            result = self._save_custom_provider(body.get("provider", ""), body.get("baseUrl", ""), body.get("models", []), body.get("params"))
+            result = self._save_custom_provider(
+                body.get("provider", ""),
+                body.get("baseUrl", ""),
+                body.get("models", []),
+                body.get("params"),
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/license/activate":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             key = body.get("key", "")
             result = activate_license(key)
@@ -6220,7 +7838,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
             return
         elif self.path == "/api/gateway/configure":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = self._configure_gateway_origin(body.get("origin", ""))
             self.send_response(200)
@@ -6230,7 +7848,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
             return
         elif self.path == "/clear-notify":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -6238,7 +7856,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
         elif self.path == "/sms-mode":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             mode = body.get("active", "agent")
             if mode not in ("user", "agent"):
@@ -6252,9 +7870,11 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"ok": True, "active": mode}).encode())
         elif self.path == "/sms-send":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
-            result = self._send_sms_intervention(body.get("to", ""), body.get("body", ""), body.get("name", ""))
+            result = self._send_sms_intervention(
+                body.get("to", ""), body.get("body", ""), body.get("name", "")
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -6264,13 +7884,15 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/upload":
             # Self-contained file upload — saves to STATUS_DIR/uploads/
             MAX_UPLOAD = 50 * 1024 * 1024  # 50MB
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             if length > MAX_UPLOAD:
                 self.send_response(413)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": "File too large (max 50MB)"}).encode())
+                self.wfile.write(
+                    json.dumps({"error": "File too large (max 50MB)"}).encode()
+                )
                 return
             try:
                 body = json.loads(self.rfile.read(length)) if length else {}
@@ -6299,7 +7921,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             print(f"📎 Upload: {dest} ({len(content):,} bytes)")
 
         elif self.path == "/api/skills-library":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_skills_library_create(body)
             self.send_response(result.get("_status", 200))
@@ -6309,7 +7931,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/skills-library/apply":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_skills_library_apply(body)
             self.send_response(result.get("_status", 200))
@@ -6319,7 +7941,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/skills-library/upload":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_skills_library_upload(body)
             self.send_response(result.get("_status", 200))
@@ -6330,7 +7952,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(result).encode())
         # ── PROJECTS POST ────────────────────────────────────────────
         elif self.path == "/api/projects":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_project_create(body)
             self.send_response(result.get("_status", 200))
@@ -6340,7 +7962,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/projects/scores/award":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_score_award(body)
             self.send_response(result.get("_status", 200))
@@ -6350,7 +7972,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/projects/from-template":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_project_from_template(body)
             self.send_response(result.get("_status", 200))
@@ -6360,7 +7982,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
         elif self.path == "/api/projects/templates":
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_save_as_template(body)
             self.send_response(result.get("_status", 200))
@@ -6369,9 +7991,13 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and self.path.endswith("/workflow/start"):
-            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/start", 1)[0]
-            length = int(self.headers.get('Content-Length', 0))
+        elif self.path.startswith("/api/projects/") and self.path.endswith(
+            "/workflow/start"
+        ):
+            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/start", 1)[
+                0
+            ]
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_workflow_start(proj_id, body)
             self.send_response(result.get("_status", 200))
@@ -6380,21 +8006,31 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             result.pop("_status", None)
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and self.path.endswith("/workflow/stop"):
-            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/stop", 1)[0]
+        elif self.path.startswith("/api/projects/") and self.path.endswith(
+            "/workflow/stop"
+        ):
+            proj_id = self.path.split("/api/projects/")[1].rsplit("/workflow/stop", 1)[
+                0
+            ]
             result = _handle_workflow_stop(proj_id)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode())
-        elif self.path.startswith("/api/projects/") and "/tasks" in self.path and "/comments" in self.path:
+        elif (
+            self.path.startswith("/api/projects/")
+            and "/tasks" in self.path
+            and "/comments" in self.path
+        ):
             # POST /api/projects/{id}/tasks/{taskId}/comments
             rest = self.path.split("/api/projects/")[1]
             parts = rest.split("/tasks/")
             proj_id = parts[0]
-            task_rest = parts[1].split("/comments")[0].strip("/") if len(parts) > 1 else ""
-            length = int(self.headers.get('Content-Length', 0))
+            task_rest = (
+                parts[1].split("/comments")[0].strip("/") if len(parts) > 1 else ""
+            )
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_task_comment(proj_id, task_rest, body)
             self.send_response(result.get("_status", 200))
@@ -6406,7 +8042,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path.startswith("/api/projects/") and self.path.endswith("/tasks"):
             # POST /api/projects/{id}/tasks
             proj_id = self.path.split("/api/projects/")[1].rsplit("/tasks", 1)[0]
-            length = int(self.headers.get('Content-Length', 0))
+            length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
             result = _handle_task_create(proj_id, body)
             self.send_response(result.get("_status", 200))
@@ -6491,13 +8127,21 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                             "id": "gw-test-1",
                             "method": "connect",
                             "params": {
-                                "minProtocol": 3, "maxProtocol": 3,
-                                "client": {"id": "openclaw-control-ui", "version": "2026.2.9", "platform": "server", "mode": "webchat"},
+                                "minProtocol": 3,
+                                "maxProtocol": 3,
+                                "client": {
+                                    "id": "openclaw-control-ui",
+                                    "version": "2026.2.9",
+                                    "platform": "server",
+                                    "mode": "webchat",
+                                },
                                 "role": "operator",
                                 "scopes": ["operator.read"],
-                                "caps": [], "commands": [], "permissions": {},
-                                "auth": {"token": token}
-                            }
+                                "caps": [],
+                                "commands": [],
+                                "permissions": {},
+                                "auth": {"token": token},
+                            },
                         }
                         await ws.send(json.dumps(connect_msg))
 
@@ -6505,22 +8149,58 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                         res = json.loads(raw2)
                         if not res.get("ok"):
                             err = res.get("error", {}).get("message", "unknown")
-                            return {"ok": True, "gateway": "reachable", "token": False, "error": err, "agents": 0}
+                            return {
+                                "ok": True,
+                                "gateway": "reachable",
+                                "token": False,
+                                "error": err,
+                                "agents": 0,
+                            }
 
                         # Connected — query sessions
-                        req = {"type": "req", "id": "gw-test-2", "method": "sessions.list", "params": {}}
+                        req = {
+                            "type": "req",
+                            "id": "gw-test-2",
+                            "method": "sessions.list",
+                            "params": {},
+                        }
                         await ws.send(json.dumps(req))
                         raw3 = await _asyncio.wait_for(ws.recv(), timeout=5)
                         res3 = json.loads(raw3)
-                        sessions = res3.get("payload", {}).get("sessions", []) if res3.get("ok") else []
-                        agent_count = sum(1 for s in sessions if isinstance(s, dict) and s.get("key", "").startswith("agent:"))
+                        sessions = (
+                            res3.get("payload", {}).get("sessions", [])
+                            if res3.get("ok")
+                            else []
+                        )
+                        agent_count = sum(
+                            1
+                            for s in sessions
+                            if isinstance(s, dict)
+                            and s.get("key", "").startswith("agent:")
+                        )
 
-                        return {"ok": True, "gateway": "reachable", "token": True, "agents": agent_count}
+                        return {
+                            "ok": True,
+                            "gateway": "reachable",
+                            "token": True,
+                            "agents": agent_count,
+                        }
 
             except (ConnectionRefusedError, ConnectionResetError, OSError):
-                return {"ok": False, "gateway": "unreachable", "token": False, "agents": 0}
+                return {
+                    "ok": False,
+                    "gateway": "unreachable",
+                    "token": False,
+                    "agents": 0,
+                }
             except Exception as e:
-                return {"ok": False, "gateway": "error", "error": str(e)[:200], "token": False, "agents": 0}
+                return {
+                    "ok": False,
+                    "gateway": "error",
+                    "error": str(e)[:200],
+                    "token": False,
+                    "agents": 0,
+                }
 
         # Run async test in a thread pool to avoid blocking the HTTP server
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -6569,30 +8249,52 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
         AUTH_TOKEN = sms_cfg.get("twilioAuthToken")
         FROM_NUMBER = sms_cfg.get("fromNumber")
         if not ACCOUNT_SID or not AUTH_TOKEN or not FROM_NUMBER:
-            return {"ok": False, "error": "SMS not configured. Set Twilio credentials in Settings or /setup."}
+            return {
+                "ok": False,
+                "error": "SMS not configured. Set Twilio credentials in Settings or /setup.",
+            }
         sms_log_path = os.path.join(self._sms_data_dir(), "sms-log.jsonl")
         contacts_path = os.path.join(self._sms_data_dir(), "sms-contacts.json")
         try:
             url = f"https://api.twilio.com/2010-04-01/Accounts/{ACCOUNT_SID}/Messages.json"
-            data = urllib.parse.urlencode({"To": to, "From": FROM_NUMBER, "Body": body}).encode()
-            credentials = base64.b64encode(f"{ACCOUNT_SID}:{AUTH_TOKEN}".encode()).decode()
+            data = urllib.parse.urlencode(
+                {"To": to, "From": FROM_NUMBER, "Body": body}
+            ).encode()
+            credentials = base64.b64encode(
+                f"{ACCOUNT_SID}:{AUTH_TOKEN}".encode()
+            ).decode()
             req = urllib.request.Request(url, data=data, method="POST")
             req.add_header("Authorization", f"Basic {credentials}")
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
             with urllib.request.urlopen(req) as resp:
                 result = json.loads(resp.read().decode())
-            entry = {"type": "intervention", "phone": to, "name": name or "Unknown", "body": body, "sid": result.get("sid"), "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            with open(sms_log_path, 'a') as f:
-                f.write(json.dumps(entry) + '\n')
+            entry = {
+                "type": "intervention",
+                "phone": to,
+                "name": name or "Unknown",
+                "body": body,
+                "sid": result.get("sid"),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
+            with open(sms_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
             try:
                 contacts = json.load(open(contacts_path))
             except Exception:
                 contacts = {}
             if to not in contacts:
-                contacts[to] = {"name": name or "Unknown", "added": time.strftime("%Y-%m-%d"), "note": "Added via Virtual Office"}
-                with open(contacts_path, 'w') as f:
+                contacts[to] = {
+                    "name": name or "Unknown",
+                    "added": time.strftime("%Y-%m-%d"),
+                    "note": "Added via Virtual Office",
+                }
+                with open(contacts_path, "w") as f:
                     json.dump(contacts, f, indent=2)
-            return {"ok": True, "sid": result.get("sid"), "status": result.get("status")}
+            return {
+                "ok": True,
+                "sid": result.get("sid"),
+                "status": result.get("status"),
+            }
         except urllib.error.HTTPError as e:
             err = e.read().decode()
             try:
@@ -6601,6 +8303,7 @@ class OfficeHandler(http.server.SimpleHTTPRequestHandler):
                 return {"ok": False, "error": err[:200]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
 
 # ─── WS PROXY QUIET MODE ─────────────────────────────────────────
 _ws_proxy_connected_logged = False
@@ -6613,8 +8316,12 @@ async def try_connect_gateway():
     for url in [GATEWAY_URL, GATEWAY_URL_FALLBACK]:
         try:
             gw = await asyncio.wait_for(
-                ws_connect(url, max_size=10 * 1024 * 1024, additional_headers={"Origin": f"http://127.0.0.1:{PORT}"}),
-                timeout=3
+                ws_connect(
+                    url,
+                    max_size=10 * 1024 * 1024,
+                    additional_headers={"Origin": f"http://127.0.0.1:{PORT}"},
+                ),
+                timeout=3,
             )
             if not _ws_proxy_connected_logged:
                 print(f"✅ Connected to gateway (WS proxy): {url}")
@@ -6677,7 +8384,9 @@ async def ws_proxy(client_ws):
 
 async def run_ws_server():
     """Run the WebSocket proxy server."""
-    async with websockets.serve(ws_proxy, "0.0.0.0", WS_PORT, max_size=10 * 1024 * 1024):
+    async with websockets.serve(
+        ws_proxy, "0.0.0.0", WS_PORT, max_size=10 * 1024 * 1024
+    ):
         print(f"🔌 WebSocket proxy on :{WS_PORT} → gateway")
         await asyncio.Future()  # run forever
 
@@ -6732,7 +8441,10 @@ def start_http_server():
         while True:
             time.sleep(30)
             gateway_presence.save_snapshot(snapshot_path)
-    snap_thread = threading.Thread(target=snapshot_loop, daemon=True, name="presence-snapshot")
+
+    snap_thread = threading.Thread(
+        target=snapshot_loop, daemon=True, name="presence-snapshot"
+    )
     snap_thread.start()
 
     _oname = VO_CONFIG["office"]["name"]
@@ -6754,8 +8466,16 @@ def _wf_auto_resume_on_startup():
         for p in data.get("projects", []):
             project_id = p["id"]
             # Find tasks in active columns
-            ip_cols = [c["id"] for c in p.get("columns", []) if c.get("title", "").lower() in ("in progress", "review")]
-            stuck_tasks = [t for t in p.get("tasks", []) if t.get("columnId") in ip_cols and t.get("assignee")]
+            ip_cols = [
+                c["id"]
+                for c in p.get("columns", [])
+                if c.get("title", "").lower() in ("in progress", "review")
+            ]
+            stuck_tasks = [
+                t
+                for t in p.get("tasks", [])
+                if t.get("columnId") in ip_cols and t.get("assignee")
+            ]
 
             for task in stuck_tasks:
                 task_id = task["id"]
@@ -6763,18 +8483,29 @@ def _wf_auto_resume_on_startup():
                 session_key = _wf_task_session_key(assignee, project_id, task_id)
 
                 # Check if there's a workflow session for this task
-                home_path = VO_CONFIG.get("openclaw", {}).get("homePath", os.path.expanduser("~/.openclaw"))
-                sessions_json_path = os.path.join(home_path, "agents", assignee, "sessions", "sessions.json")
+                home_path = VO_CONFIG.get("openclaw", {}).get(
+                    "homePath", os.path.expanduser("~/.openclaw")
+                )
+                sessions_json_path = os.path.join(
+                    home_path, "agents", assignee, "sessions", "sessions.json"
+                )
                 try:
                     with open(sessions_json_path, "r") as f:
                         sessions_data = json.load(f)
                     if session_key in sessions_data:
                         session_status = sessions_data[session_key].get("status", "")
                         if session_status in ("done", "running", "failed"):
-                            print(f"[WORKFLOW AUTO-RESUME] Found interrupted task: '{task.get('title', '?')}' (project={project_id[:8]}, session={session_status})")
+                            print(
+                                f"[WORKFLOW AUTO-RESUME] Found interrupted task: '{task.get('title', '?')}' (project={project_id[:8]}, session={session_status})"
+                            )
                             # Resume the workflow for this project
                             with _WORKFLOW_LOCK:
-                                if project_id not in _WORKFLOW_STATE or not _WORKFLOW_STATE.get(project_id, {}).get("active"):
+                                if (
+                                    project_id not in _WORKFLOW_STATE
+                                    or not _WORKFLOW_STATE.get(project_id, {}).get(
+                                        "active"
+                                    )
+                                ):
                                     auto_mode = p.get("autoMode", False)
                                     stop_flag = threading.Event()
                                     wf = {
@@ -6788,10 +8519,16 @@ def _wf_auto_resume_on_startup():
                                         "thread": None,
                                     }
                                     _WORKFLOW_STATE[project_id] = wf
-                                    t = threading.Thread(target=_wf_run_pipeline, args=(project_id, not auto_mode), daemon=True)
+                                    t = threading.Thread(
+                                        target=_wf_run_pipeline,
+                                        args=(project_id, not auto_mode),
+                                        daemon=True,
+                                    )
                                     wf["thread"] = t
                                     t.start()
-                                    print(f"[WORKFLOW AUTO-RESUME] Resumed pipeline for project {project_id[:8]} (autoMode={auto_mode})")
+                                    print(
+                                        f"[WORKFLOW AUTO-RESUME] Resumed pipeline for project {project_id[:8]} (autoMode={auto_mode})"
+                                    )
                             break  # One resume per project
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
@@ -6809,7 +8546,9 @@ if __name__ == "__main__":
     ws_thread.start()
 
     # Auto-resume interrupted workflows (in background, after server starts)
-    resume_thread = threading.Thread(target=_wf_auto_resume_on_startup, daemon=True, name="wf-auto-resume")
+    resume_thread = threading.Thread(
+        target=_wf_auto_resume_on_startup, daemon=True, name="wf-auto-resume"
+    )
     resume_thread.start()
 
     # Start HTTP server in main thread

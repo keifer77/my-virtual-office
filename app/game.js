@@ -2390,6 +2390,9 @@ class Agent {
         this.deskIdlePose = 0; // 0=scratch head, 1=yawn (yawn is rare)
         this.deskIdleTimer = 300 + Math.floor(Math.random() * 900); // randomized per agent
 
+        // --- Post-work idle policy ---
+        this._skipFirstDeskReturn = false; // armed only by an explicit working -> idle transition
+
         // --- Social proximity ---
         this.socialTarget = null;    // id of nearby agent to face
 
@@ -2866,6 +2869,14 @@ class Agent {
     }
 
     returnToDesk() {
+        // If skipping first desk return after work, stay where you are
+        if (this._skipFirstDeskReturn) {
+            this._skipFirstDeskReturn = false;
+            this.idleAction = null;
+            this.idleReturnTimer = 0;
+            this.resetIdleTimer();
+            return;
+        }
         // Safety: ensure desk exists
         if (!this.desk) this.desk = { x: Math.floor(W / 2), y: Math.floor(H / 2) };
         // Pick up item if leaving a dispenser
@@ -2962,6 +2973,9 @@ class Agent {
         this.visitTarget = null;
         this.idleReturnTimer = 0;
 
+        // Capture previous state - only set skip flag for working->idle transition
+        const prevState = this.state;
+
         const slotI = agents.indexOf(this);
         switch (state) {
             case 'working':
@@ -2971,6 +2985,8 @@ class Agent {
                 this.targetX = this.desk.x;
                 this.targetY = this.desk.y;
                 this.state = state;
+                // Post-work idle should only be armed by the real working -> idle transition.
+                this._skipFirstDeskReturn = prevState === 'working' && state === 'idle';
                 this.resetIdleTimer();
                 this.addIntent(state === 'working' ? 'Returning to desk' : 'Relaxing at desk');
                 break;
@@ -4358,12 +4374,21 @@ async function pollStatus() {
             } else {
                 const newState = entry.state || 'idle';
                 const newTask = entry.task || '';
+                const preserveManualBreakOrLounge =
+                    (agent.state === 'break' || agent.state === 'lounge') &&
+                    newState === 'idle' &&
+                    !newTask;
                 if (newState !== agent.state || newTask !== agent.task) {
                     agent.task = newTask;
-                    if (newState !== agent.state) {
+                    if (newState !== agent.state && !preserveManualBreakOrLounge) {
                         agent.moveTo(newState);
                         addGlobalLog(`${agent.emoji} ${agent.name}: ${newState}${newTask ? ' — ' + newTask : ''}`);
                     }
+                } else if (agent.state === 'idle' && (agent.idleAction === 'chasing_pet' || agent.idleAction === 'petting')) {
+                    // Stale pet idleAction - clear it and force idle behavior restart
+                    agent.idleAction = null;
+                    agent.resetIdleTimer();
+                    agent.idleTimer = 1; // Trigger immediate idle action check next frame
                 }
             }
 
